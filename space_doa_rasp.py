@@ -518,6 +518,154 @@ class BlockchainNode:
                     self.utxo_set[utxo_key] = UTXO(txid, i, vout['amount'], vout['address'])
         print("[UTXO] Rebuild complete.")
 
+    def network_thread(self):
+        """Handles UDP I/O, handshake retries, ping, INV announcements, and rebroadcast."""
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind((Config.UDP_IP, Config.UDP_PORT))
+        print(f"[NET] UDP server listening on {Config.UDP_IP}:{Config.UDP_PORT}")
+
+        self._last_hello_ms = 0
+        self._last_ping_ms = 0
+        self._last_mine_ts = now_sec()
+        self._last_inv_ms = 0
+        self._last_reb_ms = 0
+        self._last_hello_ts = 0
+
+        # Kick off HELLO proactively
+        send_hello(self._sock)
+        self._last_hello_ms = int(time.time() * 1000)
+
+        while self.running:
+            # 1) UDP pump once
+            poll_udp_once(self._sock)
+
+            # 2) Handshake retry
+            now_ms = int(time.time() * 1000)
+            if not g_sess.established and (now_ms - self._last_hello_ms) >= HELLO_RETRY_MS:
+                send_hello(self._sock)
+                self._last_hello_ms = now_ms
+
+            # 3) Keep-alive ping
+            if g_sess.established and (now_ms - self._last_ping_ms) >= PING_INTERVAL_MS:
+                send_encrypted(self._sock, MsgType.PING, b'{"ping":1}')
+                self._last_ping_ms = now_ms
+
+            # 4) INV announce (share our tip)
+            if g_sess.established and (now_ms - self._last_inv_ms) >= INV_ANNOUNCE_MS:
+                tip = len(self.chain) - 1
+                tip_hash = self.chain[-1]['hash'] if self.chain else "0" * 64
+                body = json.dumps({"tip": tip, "hash": tip_hash}, separators=(',', ':')).encode()
+                send_encrypted(self._sock, MsgType.INV, body)
+                self._last_inv_ms = now_ms
+
+            # 5) Mempool trickle rebroadcast
+            if g_sess.established and (now_ms - self._last_reb_ms) >= REBROADCAST_MS:
+                burst = 0
+                for tx in list(self.mempool)[:REB_TX_BURST]:
+                    send_encrypted(self._sock, MsgType.TX, json.dumps(tx, separators=(',', ':')).encode())
+                    burst += 1
+                    if burst >= REB_TX_BURST:
+                        break
+                self._last_reb_ms = now_ms
+
+            time.sleep(0.005)
+
+    def handle_block(self, b: Dict):
+        """Validate and append a new block to the chain."""
+        try:
+            mrk = self.calculate_merkle_root(b['transactions'])
+            if mrk != b['merkle_root']:
+                print("[BLOCK] bad merkle"); return
+            h2 = self.hash_block(b)
+            if h2 != b.get('hash', ''):
+                print("[BLOCK] bad header hash"); return
+            if not b['hash'].startswith('0' * POW_ZEROS):
+                print("[BLOCK] pow fail"); return
+            if b['index'] != len(self.chain):
+                print("[BLOCK] height mismatch"); return
+            if b['index'] == 0:
+                if b['previous_hash'] != "0" * 64:
+                    print("[BLOCK] bad genesis prev"); return
+            else:
+                if b['previous_hash'] != self.chain[-1]['hash']:
+                    print("[BLOCK] prev mismatch"); return
+
+            self.chain.append(b)
+            mined_ids = {tx['txid'] for tx in b['transactions'] if tx.get('txid')}
+            self.mempool = [t for t in self.mempool if t['txid'] not in mined_ids]
+            self.rebuild_utxo_set()
+            self.save_blockchain_to_disk()
+            GPIO.output(Config.LED_RX, GPIO.HIGH); GPIO.output(Config.LED_RX, GPIO.LOW)
+            print(f"[BLOCK] accepted h={b['index']} {b['hash'][:10]}...")
+        except Exception as e:
+            print(f"[BLOCK] error: {e}")
+
+    def process_inv(self, payload: Dict):
+        """Handle peer inventory announcements (chain tip)."""
+        peer_tip = int(payload.get("tip", 0))
+        peer_hash = payload.get("hash", "0" * 64)
+        my_tip = len(self.chain) - 1
+        my_hash = self.chain[-1]['hash'] if self.chain else "0" * 64
+        if peer_tip > my_tip:
+            body = json.dumps({"from": my_tip, "count": 1}, separators=(',', ':')).encode()
+            send_encrypted(self._sock, MsgType.GETBLOCK, body)
+        elif peer_tip == my_tip and peer_hash != my_hash and my_tip > 0:
+            body = json.dumps({"from": my_tip - 1, "count": 2}, separators=(',', ':')).encode()
+            send_encrypted(self._sock, MsgType.GETBLOCK, body)
+
+    def process_getblock(self, sender, payload: Dict):
+        """Respond to GETBLOCK requests with serialized block data."""
+        start = int(payload.get("from", 0))
+        count = max(1, min(8, int(payload.get("count", 1))))
+        tip = len(self.chain)
+        for i in range(count):
+            idx = start + i
+            if idx >= tip:
+                break
+            block_bytes = json.dumps(self.chain[idx], separators=(',', ':')).encode()
+            send_encrypted(self._sock, MsgType.BLOCK, block_bytes)
+
+    def blockchain_thread(self):
+        """Main blockchain loop: process queued messages and mine when due."""
+        last_mine_ts = now_sec()
+        while self.running:
+            try:
+                msg = self.msg_queue.get(timeout=0.5)
+                t = msg['type']
+                p = msg['payload']
+                if t == MsgType.TX:
+                    self.handle_transaction(p)
+                elif t == MsgType.BLOCK:
+                    self.handle_block(p)
+                elif t == MsgType.INV:
+                    self.process_inv(p)
+                elif t == MsgType.GETBLOCK:
+                    self.process_getblock(msg['sender'], p)
+                elif t == MsgType.PING:
+                    send_encrypted(self._sock, MsgType.PONG, json.dumps({"pong": 1}).encode())
+            except queue.Empty:
+                # Miner cadence (time or mempool pressure)
+                nowt = now_sec()
+                due_time = (nowt - last_mine_ts) >= MINE_INTERVAL_SEC
+                due_pressure = len(self.mempool) >= MEMPOOL_MINE_MIN
+                if due_time or due_pressure:
+                    self.attempt_mining()
+                    last_mine_ts = nowt
+                continue
+
+    def broadcast_message(self, type_id: int, payload: Dict):
+        """Encrypts and broadcasts to the current session peer (used by miner, etc.)."""
+        try:
+            if not self._sock:
+                print("[NET] No socket; not sending.")
+                return
+            payload_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+            ok = send_encrypted(self._sock, type_id, payload_bytes)
+            if ok:
+                print(f"[NET] Encrypted send type {type_id} -> {g_sess.peer}")
+        except Exception as e:
+            print(f"[NET] Broadcast error: {e}")
+
 
 def process_hello(from_addr, body: bytes):
     try:
@@ -609,146 +757,6 @@ def poll_udp_once(sock: socket.socket):
         node.msg_queue.put({"type": type_id, "payload": message, "sender": addr})
     except Exception as e:
         print(f"[NET] payload parse error: {e}")
-
-    def network_thread(self):
-        """Handles UDP I/O, handshake retries, ping, INV announcements, and rebroadcast."""
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.bind((Config.UDP_IP, Config.UDP_PORT))
-        print(f"[NET] UDP server listening on {Config.UDP_IP}:{Config.UDP_PORT}")
-
-        self._last_hello_ms = 0
-        self._last_ping_ms = 0
-        self._last_mine_ts = now_sec()
-        self._last_inv_ms = 0
-        self._last_reb_ms = 0
-        self._last_hello_ts = 0
-
-        # Kick off HELLO proactively
-        send_hello(self._sock)
-        self._last_hello_ms = int(time.time() * 1000)
-
-        while self.running:
-            # 1) UDP pump once
-            poll_udp_once(self._sock)
-
-            # 2) Handshake retry
-            now_ms = int(time.time() * 1000)
-            if not g_sess.established and (now_ms - self._last_hello_ms) >= HELLO_RETRY_MS:
-                send_hello(self._sock)
-                self._last_hello_ms = now_ms
-
-            # 3) Keep-alive ping
-            if g_sess.established and (now_ms - self._last_ping_ms) >= PING_INTERVAL_MS:
-                send_encrypted(self._sock, MsgType.PING, b'{"ping":1}')
-                self._last_ping_ms = now_ms
-
-            # 4) INV announce (share our tip)
-            if g_sess.established and (now_ms - self._last_inv_ms) >= INV_ANNOUNCE_MS:
-                tip = len(self.chain) - 1
-                tip_hash = self.chain[-1]['hash'] if self.chain else "0" * 64
-                body = json.dumps({"tip": tip, "hash": tip_hash}, separators=(',', ':')).encode()
-                send_encrypted(self._sock, MsgType.INV, body)
-                self._last_inv_ms = now_ms
-
-            # 5) Mempool trickle rebroadcast
-            if g_sess.established and (now_ms - self._last_reb_ms) >= REBROADCAST_MS:
-                burst = 0
-                for tx in list(self.mempool)[:REB_TX_BURST]:
-                    send_encrypted(
-                        self._sock, MsgType.TX,
-                        json.dumps(tx, separators=(',', ':')).encode()
-                    )
-                    burst += 1
-                    if burst >= REB_TX_BURST:
-                        break
-                self._last_reb_ms = now_ms
-
-            time.sleep(0.005)
-
-    def handle_block(self, b: Dict):
-        """Validate and append a new block to the chain."""
-        try:
-            mrk = self.calculate_merkle_root(b['transactions'])
-            if mrk != b['merkle_root']:
-                print("[BLOCK] bad merkle"); return
-            h2 = self.hash_block(b)
-            if h2 != b.get('hash', ''):
-                print("[BLOCK] bad header hash"); return
-            if not b['hash'].startswith('0' * POW_ZEROS):
-                print("[BLOCK] pow fail"); return
-            if b['index'] != len(self.chain):
-                print("[BLOCK] height mismatch"); return
-            if b['index'] == 0:
-                if b['previous_hash'] != "0" * 64:
-                    print("[BLOCK] bad genesis prev"); return
-            else:
-                if b['previous_hash'] != self.chain[-1]['hash']:
-                    print("[BLOCK] prev mismatch"); return
-
-            self.chain.append(b)
-            mined_ids = {tx['txid'] for tx in b['transactions'] if tx.get('txid')}
-            self.mempool = [t for t in self.mempool if t['txid'] not in mined_ids]
-            self.rebuild_utxo_set()
-            self.save_blockchain_to_disk()
-            GPIO.output(Config.LED_RX, GPIO.HIGH)
-            GPIO.output(Config.LED_RX, GPIO.LOW)
-            print(f"[BLOCK] accepted h={b['index']} {b['hash'][:10]}...")
-        except Exception as e:
-            print(f"[BLOCK] error: {e}")
-
-    def process_inv(self, payload: Dict):
-        """Handle peer inventory announcements (chain tip)."""
-        peer_tip = int(payload.get("tip", 0))
-        peer_hash = payload.get("hash", "0" * 64)
-        my_tip = len(self.chain) - 1
-        my_hash = self.chain[-1]['hash'] if self.chain else "0" * 64
-        if peer_tip > my_tip:
-            body = json.dumps({"from": my_tip, "count": 1}, separators=(',', ':')).encode()
-            send_encrypted(self._sock, MsgType.GETBLOCK, body)
-        elif peer_tip == my_tip and peer_hash != my_hash and my_tip > 0:
-            body = json.dumps({"from": my_tip - 1, "count": 2}, separators=(',', ':')).encode()
-            send_encrypted(self._sock, MsgType.GETBLOCK, body)
-
-    def process_getblock(self, sender, payload: Dict):
-        """Respond to GETBLOCK requests with serialized block data."""
-        start = int(payload.get("from", 0))
-        count = max(1, min(8, int(payload.get("count", 1))))
-        tip = len(self.chain)
-        for i in range(count):
-            idx = start + i
-            if idx >= tip:
-                break
-            block_bytes = json.dumps(self.chain[idx], separators=(',', ':')).encode()
-            send_encrypted(self._sock, MsgType.BLOCK, block_bytes)
-
-    def blockchain_thread(self):
-        """Main blockchain loop: process queued messages and mine when due."""
-        last_mine_ts = now_sec()
-        while self.running:
-            try:
-                msg = self.msg_queue.get(timeout=0.5)
-                t = msg['type']
-                p = msg['payload']
-                if t == MsgType.TX:
-                    self.handle_transaction(p)
-                elif t == MsgType.BLOCK:
-                    self.handle_block(p)
-                elif t == MsgType.INV:
-                    self.process_inv(p)
-                elif t == MsgType.GETBLOCK:
-                    self.process_getblock(msg['sender'], p)
-                elif t == MsgType.PING:
-                    send_encrypted(self._sock, MsgType.PONG, json.dumps({"pong": 1}).encode())
-            except queue.Empty:
-                # Miner cadence (time or mempool pressure)
-                nowt = now_sec()
-                due_time = (nowt - last_mine_ts) >= MINE_INTERVAL_SEC
-                due_pressure = len(self.mempool) >= MEMPOOL_MINE_MIN
-                if due_time or due_pressure:
-                    self.attempt_mining()
-                    last_mine_ts = nowt
-                continue
-
 
     def handle_transaction(self, tx: Dict):
         """Validates and adds a transaction to the mempool."""
@@ -940,17 +948,8 @@ def recv_encrypted(pkt: bytes) -> Optional[Tuple[int, bytes, Tuple[str,int]]]:
     g_sess.last_rx_ts = ts
     return (type_id, pt, None)
 
-    def broadcast_message(self, type_id: int, payload: Dict):
-        try:
-            payload_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
-            ok = send_encrypted(self._sock, type_id, payload_bytes)
-            if ok:
-                print(f"[NET] Encrypted send type {type_id} -> {g_sess.peer}")
-        except Exception as e:
-            print(f"[NET] Broadcast error: {e}")
 
-
-    def save_blockchain_to_disk(self):
+def save_blockchain_to_disk(self):
         """Saves the blockchain to disk using an atomic write."""
         temp_file = Config.CHAIN_FILE + ".tmp"
         with self.node_lock:
@@ -958,14 +957,14 @@ def recv_encrypted(pkt: bytes) -> Optional[Tuple[int, bytes, Tuple[str,int]]]:
                 json.dump({"chain": self.chain}, f)
             os.rename(temp_file, Config.CHAIN_FILE)
 
-    def load_blockchain_from_disk(self):
+def load_blockchain_from_disk(self):
         """Loads the blockchain from disk."""
         if os.path.exists(Config.CHAIN_FILE):
             with open(Config.CHAIN_FILE, 'r') as f:
                 data = json.load(f)
                 self.chain = data['chain']
 
-    def run(self):
+def run(self):
         """Starts all node threads and runs forever."""
         self.initialize()
         
