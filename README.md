@@ -353,11 +353,6 @@ pio device monitor
 
 * **Production builds:** Rotate Wi-Fi creds into NVS/Secrets, remove debug logs, pin peer pubkeys, and consider enabling watchdogs aggressively.
 
----
-
-## License
-
-TBD by project owner. If unsure, consider MIT for code examples and documentation.
 
 ---
 
@@ -373,4 +368,4 @@ TBD by project owner. If unsure, consider MIT for code examples and documentatio
 | Mine cadence       |       20 s |       20 s | Time-based             |
 | Mempool pressure   |       3 tx |       3 tx | Early mine if ≥ N      |
 
-If you want, I can tailor this README to your exact pinout, Wi-Fi mode (AP vs STA), and deployment topology (bench vs HIL vs flight).
+
