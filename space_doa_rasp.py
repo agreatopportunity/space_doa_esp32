@@ -1,535 +1,607 @@
 #!/usr/bin/env python3
 """
-Raspberry Pi CubeSat Blockchain Node
-Complete implementation for orbital blockchain operations
+SPACE DOA - Raspberry Pi CubeSat Blockchain Node
+Production-Ready Implementation v3.0.0
+
 """
 
+import os
 import time
 import hashlib
 import json
-import RPi.GPIO as GPIO
-from datetime import datetime
-from typing import List, Dict, Optional
-import spidev
-import smbus
-import serial
+import socket
+import struct
 import threading
 import queue
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
 
-# GPIO Pin Configuration
-class PinConfig:
-    # LoRa Module (SX1278)
-    LORA_CS = 8
-    LORA_RST = 22
-    LORA_DIO0 = 24
-    LORA_DIO1 = 23
-    
-    # Status LEDs
-    LED_POWER = 17
+# --- Third-party libraries ---
+# Install using: pip install cryptography RPi.GPIO spidev smbus
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
+import RPi.GPIO as GPIO
+import spidev
+import smbus
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+class Config:
+    # GPIO Pin Configuration
+    LED_STATUS = 17
     LED_TX = 27
     LED_RX = 18
     LED_ERROR = 25
-    
-    # Power Management
-    POWER_GOOD = 5
-    BATTERY_MONITOR = 6
 
-# I2C Configuration
-I2C_BUS = 1
-IMU_ADDRESS = 0x68  # MPU9250
-TEMP_ADDRESS = 0x48  # Temperature sensor
+    # I2C Configuration
+    I2C_BUS = 1
+    IMU_ADDRESS = 0x68  # MPU9250/MPU6050
 
-class BlockchainNode:
-    """Main blockchain node implementation for Raspberry Pi"""
-    
+    # Network Configuration
+    UDP_IP = "0.0.0.0"  # Listen on all interfaces
+    UDP_PORT = 8888
+    ESP32_IP = "192.168.1.100" # Manually set the ESP32's IP for now
+    PROTOCOL_VERSION = 1
+    RX_WINDOW_SEC = 60  # Accept messages within ±60s of current time
+
+    # Rate Limiting (Token Bucket Algorithm)
+    TOKEN_BUCKET_RATE = 6  # msgs per second allowed
+    TOKEN_BUCKET_SIZE = 30  # burst size
+
+    # Blockchain Parameters
+    MAX_TX_PER_BLOCK = 10
+    DIFFICULTY_LEADING_ZEROES = 4
+    BLOCK_REWARD = 50000000  # 0.5 "coins" in satoshis
+    COINBASE_MATURITY = 10 # Blocks before coinbase can be spent
+
+    # Storage
+    CHAIN_FILE = "blockchain.json"
+    KEY_FILE = "node_key.pem"
+    KEY_PASSWORD = b"space-doa-is-secure" # Password to encrypt the private key on disk
+
+# =============================================================================
+# UTILITY & DATA STRUCTURES
+# =============================================================================
+
+def now_sec() -> int:
+    """Returns the current time as monotonic seconds."""
+    return int(time.monotonic())
+
+def to_hex(data: bytes) -> str:
+    return data.hex()
+
+def from_hex(data_str: str) -> bytes:
+    return bytes.fromhex(data_str)
+
+class UTXO:
+    def __init__(self, txid: str, index: int, amount: int, address: str):
+        self.txid = txid
+        self.index = index
+        self.amount = amount
+        self.address = address
+
+    def __repr__(self):
+        return f"UTXO(txid={self.txid[:10]}..., index={self.index}, amount={self.amount}, address={self.address})"
+
+# =============================================================================
+# CRYPTOGRAPHY LAYER
+# =============================================================================
+
+class CryptoLayer:
     def __init__(self):
+        self._private_key: Optional[ec.EllipticCurvePrivateKey] = None
+        self._public_key: Optional[ec.EllipticCurvePublicKey] = None
+        self.address: Optional[str] = None
+        self._net_key: Optional[bytes] = None
+
+    def initialize(self):
+        """Load keys or generate new ones if they don't exist."""
+        if os.path.exists(Config.KEY_FILE):
+            print("[CRYPTO] Loading existing private key...")
+            self.load_private_key(Config.KEY_FILE, Config.KEY_PASSWORD)
+        else:
+            print("[CRYPTO] No key file found. Generating new identity...")
+            self.generate_keys()
+            self.save_private_key(Config.KEY_FILE, Config.KEY_PASSWORD)
+        
+        self.address = self.generate_address(self.get_public_key_compressed())
+        print(f"[CRYPTO] Node Address: {self.address}")
+        
+        # Generate a stable network key from the private key for AES-GCM
+        self._net_key = hashlib.sha256(self._private_key.private_numbers().private_value.to_bytes(32, 'big')).digest()
+        print("[CRYPTO] Network encryption key derived.")
+
+    def generate_keys(self):
+        self._private_key = ec.generate_private_key(ec.SECP256R1())
+        self._public_key = self._private_key.public_key()
+
+    def save_private_key(self, filename: str, password: bytes):
+        pem = self._private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.BestAvailableEncryption(password)
+        )
+        with open(filename, 'wb') as f:
+            f.write(pem)
+
+    def load_private_key(self, filename: str, password: bytes):
+        with open(filename, 'rb') as f:
+            pem = f.read()
+        self._private_key = serialization.load_pem_private_key(pem, password=password)
+        self._public_key = self._private_key.public_key()
+
+    def get_public_key_compressed(self) -> bytes:
+        return self._public_key.public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.CompressedPoint
+        )
+
+    @staticmethod
+    def generate_address(public_key_compressed: bytes) -> str:
+        """Generates a P2PKH-style address from a compressed public key."""
+        sha256_hash = hashlib.sha256(public_key_compressed).digest()
+        ripemd160 = hashlib.new('ripemd160')
+        ripemd160.update(sha256_hash)
+        ripemd160_hash = ripemd160.digest()
+        
+        versioned_hash = b'\x00' + ripemd160_hash # 0x00 for mainnet
+        checksum = hashlib.sha256(hashlib.sha256(versioned_hash).digest()).digest()[:4]
+        
+        binary_address = versioned_hash + checksum
+        
+        # Base58 encode
+        alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+        value = int.from_bytes(binary_address, 'big')
+        encoded = ''
+        while value > 0:
+            value, remainder = divmod(value, 58)
+            encoded = alphabet[remainder] + encoded
+        
+        # Prepend leading zeros
+        for byte in binary_address:
+            if byte == 0:
+                encoded = '1' + encoded
+            else:
+                break
+        return encoded
+
+    def sign(self, data: bytes) -> bytes:
+        """Signs data and returns the DER-encoded signature."""
+        return self._private_key.sign(data, ec.ECDSA(hashes.SHA256()))
+
+    @staticmethod
+    def verify(public_key_compressed: bytes, signature: bytes, data: bytes) -> bool:
+        """Verifies a signature using a compressed public key."""
+        try:
+            public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), public_key_compressed)
+            public_key.verify(signature, data, ec.ECDSA(hashes.SHA256()))
+            return True
+        except Exception:
+            return False
+
+    def aead_encrypt(self, plaintext: bytes, associated_data: bytes) -> Optional[bytes]:
+        """Encrypts and authenticates data using AES-GCM."""
+        if not self._net_key: return None
+        aesgcm = AESGCM(self._net_key)
+        nonce = os.urandom(12)
+        ciphertext = aesgcm.encrypt(nonce, plaintext, associated_data)
+        return nonce + ciphertext # Nonce (12) + Ciphertext + Tag (16)
+
+    def aead_decrypt(self, encrypted_packet: bytes, associated_data: bytes) -> Optional[bytes]:
+        """Decrypts and verifies data using AES-GCM."""
+        if not self._net_key: return None
+        try:
+            aesgcm = AESGCM(self._net_key)
+            nonce = encrypted_packet[:12]
+            ciphertext_with_tag = encrypted_packet[12:]
+            return aesgcm.decrypt(nonce, ciphertext_with_tag, associated_data)
+        except InvalidTag:
+            print("[CRYPTO] Decryption failed: Invalid authentication tag.")
+            return None
+
+# =============================================================================
+# HARDWARE LAYER
+# =============================================================================
+
+class Hardware:
+    def __init__(self):
+        self.i2c = None
         self.setup_gpio()
         self.setup_i2c()
-        self.setup_spi()
-        self.setup_lora()
-        
-        # Blockchain state
-        self.chain: List[Dict] = []
-        self.pending_transactions: List[Dict] = []
-        self.utxo_set: Dict = {}
-        self.peers: List[str] = []
-        
-        # Node identity
-        self.private_key = self.generate_private_key()
-        self.public_key = self.derive_public_key(self.private_key)
-        self.address = self.generate_address(self.public_key)
-        
-        # Threading
-        self.tx_queue = queue.Queue()
-        self.block_queue = queue.Queue()
-        self.running = True
-        
+
     def setup_gpio(self):
-        """Initialize GPIO pins"""
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        
-        # Setup outputs
-        for pin in [PinConfig.LED_POWER, PinConfig.LED_TX, 
-                   PinConfig.LED_RX, PinConfig.LED_ERROR]:
-            GPIO.setup(pin, GPIO.OUT)
-            GPIO.output(pin, GPIO.LOW)
-        
-        # Setup inputs
-        GPIO.setup(PinConfig.POWER_GOOD, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(PinConfig.LORA_DIO0, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-        
-        # Power LED on
-        GPIO.output(PinConfig.LED_POWER, GPIO.HIGH)
-    
-    def setup_i2c(self):
-        """Initialize I2C bus for sensors"""
-        self.i2c = smbus.SMBus(I2C_BUS)
-        
-        # Initialize IMU
-        self.i2c.write_byte_data(IMU_ADDRESS, 0x6B, 0x00)  # Wake up MPU9250
-        time.sleep(0.1)
-        
-    def setup_spi(self):
-        """Initialize SPI for LoRa module"""
-        self.spi = spidev.SpiDev()
-        self.spi.open(0, 0)  # Bus 0, Device 0
-        self.spi.max_speed_hz = 5000000
-        self.spi.mode = 0b00
-        
-    def setup_lora(self):
-        """Initialize LoRa module"""
-        # Reset LoRa module
-        GPIO.setup(PinConfig.LORA_RST, GPIO.OUT)
-        GPIO.output(PinConfig.LORA_RST, GPIO.LOW)
-        time.sleep(0.01)
-        GPIO.output(PinConfig.LORA_RST, GPIO.HIGH)
-        time.sleep(0.1)
-        
-        # Configure LoRa registers
-        self.lora_write_register(0x01, 0x80)  # Sleep mode
-        self.lora_write_register(0x01, 0x81)  # LoRa mode
-        
-        # Set frequency (433 MHz)
-        freq = int(433000000 / (32000000 / 2**19))
-        self.lora_write_register(0x06, (freq >> 16) & 0xFF)
-        self.lora_write_register(0x07, (freq >> 8) & 0xFF)
-        self.lora_write_register(0x08, freq & 0xFF)
-        
-        # Set spreading factor, bandwidth, coding rate
-        self.lora_write_register(0x1D, 0x72)  # SF7, BW125, CR4/5
-        self.lora_write_register(0x1E, 0x74)  # SF7, CRC on
-        
-        # Set TX power (17 dBm)
-        self.lora_write_register(0x09, 0x8F)
-        
-    def lora_write_register(self, address: int, value: int):
-        """Write to LoRa register via SPI"""
-        GPIO.output(PinConfig.LORA_CS, GPIO.LOW)
-        self.spi.xfer2([address | 0x80, value])
-        GPIO.output(PinConfig.LORA_CS, GPIO.HIGH)
-        
-    def lora_read_register(self, address: int) -> int:
-        """Read from LoRa register via SPI"""
-        GPIO.output(PinConfig.LORA_CS, GPIO.LOW)
-        data = self.spi.xfer2([address & 0x7F, 0x00])
-        GPIO.output(PinConfig.LORA_CS, GPIO.HIGH)
-        return data[1]
-    
-    def generate_private_key(self) -> bytes:
-        """Generate ECDSA private key"""
-        import secrets
-        return secrets.token_bytes(32)
-    
-    def derive_public_key(self, private_key: bytes) -> bytes:
-        """Derive public key from private key"""
-        # Simplified - use proper ECDSA library in production
-        return hashlib.sha256(private_key).digest()
-    
-    def generate_address(self, public_key: bytes) -> str:
-        """Generate blockchain address from public key"""
-        # Simplified address generation
-        hash160 = hashlib.new('ripemd160')
-        hash160.update(hashlib.sha256(public_key).digest())
-        return 'PI' + hash160.hexdigest()[:30].upper()
-    
-    def create_transaction(self, recipient: str, amount: float) -> Dict:
-        """Create and sign a new transaction"""
-        GPIO.output(PinConfig.LED_TX, GPIO.HIGH)
-        
-        transaction = {
-            'from': self.address,
-            'to': recipient,
-            'amount': amount,
-            'timestamp': time.time(),
-            'nonce': len(self.pending_transactions)
-        }
-        
-        # Sign transaction
-        tx_string = json.dumps(transaction, sort_keys=True)
-        signature = self.sign_data(tx_string.encode())
-        transaction['signature'] = signature.hex()
-        
-        # Calculate transaction ID
-        transaction['txid'] = hashlib.sha256(
-            (tx_string + signature.hex()).encode()
-        ).hexdigest()
-        
-        self.pending_transactions.append(transaction)
-        GPIO.output(PinConfig.LED_TX, GPIO.LOW)
-        
-        return transaction
-    
-    def sign_data(self, data: bytes) -> bytes:
-        """Sign data with private key"""
-        # Simplified - use proper ECDSA in production
-        return hashlib.sha256(data + self.private_key).digest()
-    
-    def verify_signature(self, data: bytes, signature: bytes, public_key: bytes) -> bool:
-        """Verify signature"""
-        # Simplified verification
-        expected = hashlib.sha256(data + public_key).digest()
-        return expected == signature
-    
-    def mine_block(self) -> Optional[Dict]:
-        """Mine a new block"""
-        if not self.pending_transactions:
-            return None
-        
-        print("Mining new block...")
-        
-        # Get previous block
-        previous_block = self.chain[-1] if self.chain else None
-        previous_hash = previous_block['hash'] if previous_block else '0' * 64
-        
-        # Create new block
-        block = {
-            'index': len(self.chain),
-            'timestamp': time.time(),
-            'transactions': self.pending_transactions[:10],  # Max 10 tx per block
-            'previous_hash': previous_hash,
-            'nonce': 0
-        }
-        
-        # Proof of Work
-        target = '0000'  # Difficulty target
-        while True:
-            block_string = json.dumps(block, sort_keys=True)
-            block_hash = hashlib.sha256(block_string.encode()).hexdigest()
-            
-            if block_hash.startswith(target):
-                block['hash'] = block_hash
-                break
-            
-            block['nonce'] += 1
-            
-            # Check if we should stop mining
-            if not self.running:
-                return None
-        
-        # Add block to chain
-        self.chain.append(block)
-        
-        # Clear pending transactions
-        self.pending_transactions = []
-        
-        print(f"Block mined! Hash: {block_hash}")
-        return block
-    
-    def broadcast_transaction(self, transaction: Dict):
-        """Broadcast transaction via LoRa"""
-        GPIO.output(PinConfig.LED_TX, GPIO.HIGH)
-        
-        # Prepare packet
-        packet = {
-            'type': 'TX',
-            'data': transaction
-        }
-        packet_bytes = json.dumps(packet).encode()
-        
-        # Send via LoRa
-        self.lora_transmit(packet_bytes)
-        
-        GPIO.output(PinConfig.LED_TX, GPIO.LOW)
-    
-    def lora_transmit(self, data: bytes):
-        """Transmit data via LoRa"""
-        # Set to standby mode
-        self.lora_write_register(0x01, 0x81)
-        
-        # Set payload length
-        self.lora_write_register(0x22, len(data))
-        
-        # Write data to FIFO
-        self.lora_write_register(0x0D, 0x80)  # FIFO address
-        GPIO.output(PinConfig.LORA_CS, GPIO.LOW)
-        self.spi.xfer2([0x80] + list(data))
-        GPIO.output(PinConfig.LORA_CS, GPIO.HIGH)
-        
-        # Start transmission
-        self.lora_write_register(0x01, 0x83)
-        
-        # Wait for transmission complete
-        while not GPIO.input(PinConfig.LORA_DIO0):
-            time.sleep(0.001)
-        
-        # Clear IRQ
-        self.lora_write_register(0x12, 0xFF)
-    
-    def lora_receive(self) -> Optional[bytes]:
-        """Receive data via LoRa"""
-        # Check if data available
-        if not GPIO.input(PinConfig.LORA_DIO0):
-            return None
-        
-        GPIO.output(PinConfig.LED_RX, GPIO.HIGH)
-        
-        # Read payload length
-        length = self.lora_read_register(0x13)
-        
-        # Read FIFO
-        self.lora_write_register(0x0D, 0x00)  # FIFO address
-        GPIO.output(PinConfig.LORA_CS, GPIO.LOW)
-        data = self.spi.xfer2([0x00] + [0x00] * length)
-        GPIO.output(PinConfig.LORA_CS, GPIO.HIGH)
-        
-        # Clear IRQ
-        self.lora_write_register(0x12, 0xFF)
-        
-        GPIO.output(PinConfig.LED_RX, GPIO.LOW)
-        
-        return bytes(data[1:])
-    
-    def read_sensors(self) -> Dict:
-        """Read sensor data"""
-        sensor_data = {}
-        
-        # Read IMU data
         try:
-            # Accelerometer
-            accel_x = self.read_i2c_word(IMU_ADDRESS, 0x3B) / 16384.0
-            accel_y = self.read_i2c_word(IMU_ADDRESS, 0x3D) / 16384.0
-            accel_z = self.read_i2c_word(IMU_ADDRESS, 0x3F) / 16384.0
-            
-            # Gyroscope
-            gyro_x = self.read_i2c_word(IMU_ADDRESS, 0x43) / 131.0
-            gyro_y = self.read_i2c_word(IMU_ADDRESS, 0x45) / 131.0
-            gyro_z = self.read_i2c_word(IMU_ADDRESS, 0x47) / 131.0
-            
-            # Temperature
-            temp_raw = self.read_i2c_word(IMU_ADDRESS, 0x41)
-            temperature = (temp_raw / 340.0) + 36.53
-            
-            sensor_data['imu'] = {
-                'accel': {'x': accel_x, 'y': accel_y, 'z': accel_z},
-                'gyro': {'x': gyro_x, 'y': gyro_y, 'z': gyro_z},
-                'temp': temperature
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            for pin in [Config.LED_STATUS, Config.LED_TX, Config.LED_RX, Config.LED_ERROR]:
+                GPIO.setup(pin, GPIO.OUT)
+                GPIO.output(pin, GPIO.LOW)
+            GPIO.output(Config.LED_STATUS, GPIO.HIGH) # Indicate boot
+        except Exception as e:
+            print(f"[HARDWARE] GPIO setup failed: {e}")
+
+    def setup_i2c(self):
+        try:
+            self.i2c = smbus.SMBus(Config.I2C_BUS)
+            # Wake up MPU6050/9250
+            self.i2c.write_byte_data(Config.IMU_ADDRESS, 0x6B, 0x00)
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"[HARDWARE] I2C setup failed: {e}")
+            self.i2c = None
+
+    def read_sensors(self) -> Dict:
+        """Reads sensor data with graceful error handling."""
+        if not self.i2c:
+            return {"error": "I2C not initialized"}
+        try:
+            # Read 16-bit word helper
+            def read_word_2c(reg):
+                high = self.i2c.read_byte_data(Config.IMU_ADDRESS, reg)
+                low = self.i2c.read_byte_data(Config.IMU_ADDRESS, reg + 1)
+                val = (high << 8) + low
+                if val >= 0x8000:
+                    return -((65535 - val) + 1)
+                return val
+
+            return {
+                'accel_x': read_word_2c(0x3B) / 16384.0,
+                'accel_y': read_word_2c(0x3D) / 16384.0,
+                'accel_z': read_word_2c(0x3F) / 16384.0,
+                'temp_c': (read_word_2c(0x41) / 340.0) + 36.53
             }
         except Exception as e:
-            print(f"IMU read error: {e}")
-            GPIO.output(PinConfig.LED_ERROR, GPIO.HIGH)
+            print(f"[HARDWARE] IMU read error: {e}")
+            GPIO.output(Config.LED_ERROR, GPIO.HIGH)
+            return {"error": str(e)}
+
+    def cleanup(self):
+        GPIO.cleanup()
+
+# =============================================================================
+# MAIN BLOCKCHAIN NODE CLASS
+# =============================================================================
+
+class BlockchainNode:
+    def __init__(self):
+        self.crypto = CryptoLayer()
+        self.hardware = Hardware()
         
-        # Check power status
-        sensor_data['power_good'] = GPIO.input(PinConfig.POWER_GOOD)
+        self.chain: List[Dict] = []
+        self.mempool: List[Dict] = []
+        self.utxo_set: Dict[str, UTXO] = {} # Key: "txid:index"
         
-        return sensor_data
-    
-    def read_i2c_word(self, address: int, register: int) -> int:
-        """Read 16-bit word from I2C device"""
-        high = self.i2c.read_byte_data(address, register)
-        low = self.i2c.read_byte_data(address, register + 1)
-        value = (high << 8) + low
+        self.node_lock = threading.Lock()
+        self.msg_queue = queue.Queue()
+        self.running = True
+
+        # Rate Limiting
+        self.token_bucket = Config.TOKEN_BUCKET_SIZE
+        self.last_token_fill = now_sec()
+
+    def initialize(self):
+        """Initializes all components of the node."""
+        self.crypto.initialize()
+        self.load_blockchain_from_disk()
         
-        # Convert to signed
-        if value >= 0x8000:
-            value = -((65535 - value) + 1)
+        if not self.chain:
+            print("[CHAIN] No blockchain found. Creating genesis block...")
+            self.create_genesis_block()
         
-        return value
-    
+        self.rebuild_utxo_set()
+        print(f"[CHAIN] Blockchain loaded. Height: {len(self.chain) - 1}. UTXOs: {len(self.utxo_set)}")
+        GPIO.output(Config.LED_STATUS, GPIO.LOW) # Indicate ready
+
+    def create_genesis_block(self):
+        """Creates the very first block in the chain."""
+        genesis_block = {
+            "index": 0,
+            "timestamp": 0,
+            "transactions": [],
+            "previous_hash": "0" * 64,
+            "nonce": 0,
+            "merkle_root": "0" * 64
+        }
+        genesis_block["hash"] = self.hash_block(genesis_block)
+        self.chain.append(genesis_block)
+        self.save_blockchain_to_disk()
+
+    def rebuild_utxo_set(self):
+        """Rebuilds the UTXO set from the entire blockchain."""
+        print("[UTXO] Rebuilding UTXO set from chain...")
+        self.utxo_set.clear()
+        for block in self.chain:
+            for tx in block['transactions']:
+                txid = tx['txid']
+                # Remove spent UTXOs
+                if txid != "0"*64: # Not a coinbase transaction
+                    for vin in tx['vin']:
+                        utxo_key = f"{vin['txid']}:{vin['vout']}"
+                        if utxo_key in self.utxo_set:
+                            del self.utxo_set[utxo_key]
+                # Add new UTXOs
+                for i, vout in enumerate(tx['vout']):
+                    utxo_key = f"{txid}:{i}"
+                    self.utxo_set[utxo_key] = UTXO(txid, i, vout['amount'], vout['address'])
+        print("[UTXO] Rebuild complete.")
+
+
     def network_thread(self):
-        """Network communication thread"""
+        """Handles UDP communication for receiving messages."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((Config.UDP_IP, Config.UDP_PORT))
+        print(f"[NET] UDP server listening on {Config.UDP_IP}:{Config.UDP_PORT}")
+
         while self.running:
-            # Check for incoming messages
-            data = self.lora_receive()
-            if data:
-                try:
-                    packet = json.loads(data.decode())
-                    
-                    if packet['type'] == 'TX':
-                        # Add to transaction queue
-                        self.tx_queue.put(packet['data'])
-                    elif packet['type'] == 'BLOCK':
-                        # Add to block queue
-                        self.block_queue.put(packet['data'])
-                    elif packet['type'] == 'PING':
-                        # Respond to ping
-                        self.send_pong(packet['from'])
-                        
-                except Exception as e:
-                    print(f"Network error: {e}")
-            
-            time.sleep(0.1)
-    
-    def blockchain_thread(self):
-        """Blockchain processing thread"""
-        while self.running:
-            # Process incoming transactions
             try:
-                tx = self.tx_queue.get(timeout=1)
-                if self.verify_transaction(tx):
-                    self.pending_transactions.append(tx)
-            except queue.Empty:
-                pass
-            
-            # Mine block if enough transactions
-            if len(self.pending_transactions) >= 5:
-                block = self.mine_block()
-                if block:
-                    self.broadcast_block(block)
-            
-            time.sleep(1)
-    
-    def telemetry_thread(self):
-        """Telemetry collection thread"""
+                data, addr = sock.recvfrom(1024)
+                GPIO.output(Config.LED_RX, GPIO.HIGH)
+                
+                # --- Rate Limiting ---
+                current_time = now_sec()
+                time_passed = current_time - self.last_token_fill
+                self.token_bucket += time_passed * Config.TOKEN_BUCKET_RATE
+                if self.token_bucket > Config.TOKEN_BUCKET_SIZE:
+                    self.token_bucket = Config.TOKEN_BUCKET_SIZE
+                self.last_token_fill = current_time
+
+                if self.token_bucket < 1:
+                    print(f"[NET] Rate limit exceeded for {addr}. Packet dropped.")
+                    continue
+                self.token_bucket -= 1
+
+                # --- Protocol Deserialization ---
+                if len(data) < 13: continue # Header is 13 bytes
+                ver, ts, seq, type_id = struct.unpack('!IIIB', data[:13])
+                
+                if ver != Config.PROTOCOL_VERSION: continue
+
+                if not (now_sec() - Config.RX_WINDOW_SEC <= ts <= now_sec() + Config.RX_WINDOW_SEC):
+                    print(f"[NET] Stale packet from {addr}. Dropped.")
+                    continue
+                    
+                # --- Decryption ---
+                header = data[:13]
+                encrypted_payload = data[13:]
+                payload = self.crypto.aead_decrypt(encrypted_payload, header)
+
+                if payload:
+                    message = json.loads(payload.decode())
+                    self.msg_queue.put({"type": type_id, "payload": message, "sender": addr})
+
+                GPIO.output(Config.LED_RX, GPIO.LOW)
+            except Exception as e:
+                print(f"[NET] Network thread error: {e}")
+
+    def blockchain_thread(self):
+        """Main thread for processing messages and managing the blockchain."""
         while self.running:
-            # Read sensors
-            sensor_data = self.read_sensors()
+            try:
+                msg = self.msg_queue.get(timeout=1)
+                
+                if msg['type'] == 1: # Transaction
+                    self.handle_transaction(msg['payload'])
+                elif msg['type'] == 2: # Block
+                    self.handle_block(msg['payload'])
+                # Add handlers for PING, etc.
+
+            except queue.Empty:
+                # No messages, try to mine a block
+                self.attempt_mining()
+                continue
+
+    def handle_transaction(self, tx: Dict):
+        """Validates and adds a transaction to the mempool."""
+        with self.node_lock:
+            if not self.validate_transaction(tx):
+                print(f"[CHAIN] Invalid transaction {tx['txid'][:10]}... received.")
+                return
             
-            # Create telemetry packet
-            telemetry = {
-                'timestamp': time.time(),
-                'node': self.address,
-                'sensors': sensor_data,
-                'blockchain': {
-                    'height': len(self.chain),
-                    'pending_tx': len(self.pending_transactions),
-                    'peers': len(self.peers)
-                }
-            }
-            
-            # Log telemetry
-            print(f"Telemetry: {json.dumps(telemetry, indent=2)}")
-            
-            # Sleep for 10 seconds
-            time.sleep(10)
-    
-    def verify_transaction(self, tx: Dict) -> bool:
-        """Verify transaction validity"""
-        # Check required fields
-        required = ['from', 'to', 'amount', 'timestamp', 'signature', 'txid']
-        if not all(field in tx for field in required):
-            return False
-        
-        # Verify signature (simplified)
+            # Check for duplicates
+            if any(t['txid'] == tx['txid'] for t in self.mempool):
+                return
+
+            self.mempool.append(tx)
+            print(f"[MEMPOOL] Added transaction {tx['txid'][:10]}... | Size: {len(self.mempool)}")
+
+    def validate_transaction(self, tx: Dict, check_utxo=True) -> bool:
+        """Full validation of a transaction."""
+        # 1. Verify signature
         tx_copy = tx.copy()
-        signature = bytes.fromhex(tx_copy.pop('signature'))
-        tx_string = json.dumps(tx_copy, sort_keys=True)
+        signature = from_hex(tx_copy.pop('signature'))
+        tx_copy.pop('txid') # txid is not part of the signed data
         
-        # In production, verify with actual public key
+        # Create a deterministic string to sign/verify
+        signed_data = json.dumps(tx_copy, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        
+        if not self.crypto.verify(from_hex(tx['from_pubkey']), signature, signed_data):
+            print("[VALIDATE] Signature verification failed.")
+            return False
+
+        if not check_utxo: return True
+
+        # 2. Check inputs and UTXOs
+        total_in = 0
+        for vin in tx['vin']:
+            utxo_key = f"{vin['txid']}:{vin['vout']}"
+            if utxo_key not in self.utxo_set:
+                print(f"[VALIDATE] Input UTXO not found: {utxo_key}")
+                return False
+            
+            utxo = self.utxo_set[utxo_key]
+            # Check if the sender's address matches the UTXO's address
+            expected_address = self.crypto.generate_address(from_hex(tx['from_pubkey']))
+            if utxo.address != expected_address:
+                print(f"[VALIDATE] Address mismatch for UTXO {utxo_key}")
+                return False
+            
+            total_in += utxo.amount
+        
+        # 3. Check outputs
+        total_out = sum(vout['amount'] for vout in tx['vout'])
+        
+        if total_in < total_out:
+            print(f"[VALIDATE] Insufficient funds: IN={total_in}, OUT={total_out}")
+            return False
+            
         return True
-    
-    def broadcast_block(self, block: Dict):
-        """Broadcast block via LoRa"""
-        packet = {
-            'type': 'BLOCK',
-            'data': block
+
+    def attempt_mining(self):
+        """Mines a new block if there are transactions in the mempool."""
+        with self.node_lock:
+            if not self.mempool:
+                return
+
+            print(f"[MINING] Attempting to mine a new block with {len(self.mempool)} transactions...")
+            
+            # Select transactions for the new block
+            transactions_to_mine = self.mempool[:Config.MAX_TX_PER_BLOCK]
+            
+            # Add coinbase transaction
+            coinbase_tx = self.create_coinbase_transaction(transactions_to_mine)
+            
+            block_transactions = [coinbase_tx] + transactions_to_mine
+            
+            # Create the block
+            previous_block = self.chain[-1]
+            new_block = {
+                "index": previous_block['index'] + 1,
+                "timestamp": now_sec(),
+                "transactions": block_transactions,
+                "previous_hash": previous_block['hash'],
+                "merkle_root": self.calculate_merkle_root(block_transactions),
+                "nonce": 0
+            }
+
+            # Proof of Work
+            target = '0' * Config.DIFFICULTY_LEADING_ZEROES
+            while True:
+                block_hash = self.hash_block(new_block)
+                if block_hash.startswith(target):
+                    new_block['hash'] = block_hash
+                    break
+                new_block['nonce'] += 1
+
+            print(f"[MINING] Block {new_block['index']} mined! Hash: {new_block['hash'][:10]}...")
+            
+            # Add to chain and update state
+            self.chain.append(new_block)
+            self.mempool = self.mempool[Config.MAX_TX_PER_BLOCK:]
+            self.rebuild_utxo_set() # Easiest way to update UTXOs after a block
+            self.save_blockchain_to_disk()
+            
+            # Broadcast the new block
+            self.broadcast_message(2, new_block)
+
+    def create_coinbase_transaction(self, block_txs: List[Dict]) -> Dict:
+        """Creates the coinbase transaction that awards the miner."""
+        tx_fees = sum(tx['fee'] for tx in block_txs)
+        total_reward = Config.BLOCK_REWARD + tx_fees
+        
+        coinbase = {
+            "txid": "0" * 64,
+            "vin": [{"txid": "0"*64, "vout": -1}],
+            "vout": [{"amount": total_reward, "address": self.crypto.address}],
+            # No signature needed for coinbase
         }
-        packet_bytes = json.dumps(packet).encode()
-        self.lora_transmit(packet_bytes)
-    
-    def send_pong(self, address: str):
-        """Send pong response"""
-        packet = {
-            'type': 'PONG',
-            'from': self.address,
-            'to': address
-        }
-        packet_bytes = json.dumps(packet).encode()
-        self.lora_transmit(packet_bytes)
-    
-    def save_blockchain(self, filename: str = 'blockchain.json'):
-        """Save blockchain to file"""
-        with open(filename, 'w') as f:
-            json.dump({
-                'chain': self.chain,
-                'utxo_set': self.utxo_set,
-                'peers': self.peers
-            }, f, indent=2)
-    
-    def load_blockchain(self, filename: str = 'blockchain.json'):
-        """Load blockchain from file"""
+        return coinbase
+
+    @staticmethod
+    def hash_block(block: Dict) -> str:
+        """Hashes a block header."""
+        header_string = json.dumps({
+            "index": block['index'],
+            "timestamp": block['timestamp'],
+            "previous_hash": block['previous_hash'],
+            "merkle_root": block['merkle_root'],
+            "nonce": block['nonce']
+        }, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        return hashlib.sha256(header_string).hexdigest()
+
+    @staticmethod
+    def calculate_merkle_root(transactions: List[Dict]) -> str:
+        """Calculates the Merkle root of a list of transactions."""
+        if not transactions:
+            return "0" * 64
+        
+        txids = [tx['txid'] for tx in transactions]
+        
+        while len(txids) > 1:
+            if len(txids) % 2 != 0:
+                txids.append(txids[-1]) # Duplicate last hash if odd
+            
+            new_level = []
+            for i in range(0, len(txids), 2):
+                combined = (txids[i] + txids[i+1]).encode('utf-8')
+                new_level.append(hashlib.sha256(combined).hexdigest())
+            txids = new_level
+            
+        return txids[0]
+
+    def broadcast_message(self, type_id: int, payload: Dict):
+        """Encrypts and broadcasts a message to known peers (ESP32)."""
         try:
-            with open(filename, 'r') as f:
+            GPIO.output(Config.LED_TX, GPIO.HIGH)
+            payload_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+            header = struct.pack('!IIIB', Config.PROTOCOL_VERSION, now_sec(), 0, type_id) # Seq 0 for now
+            
+            encrypted_packet = self.crypto.aead_encrypt(payload_bytes, header)
+            
+            if encrypted_packet:
+                full_packet = header + encrypted_packet
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.sendto(full_packet, (Config.ESP32_IP, Config.UDP_PORT))
+                print(f"[NET] Broadcasted message type {type_id} to {Config.ESP32_IP}")
+        except Exception as e:
+            print(f"[NET] Broadcast error: {e}")
+        finally:
+            GPIO.output(Config.LED_TX, GPIO.LOW)
+
+    def save_blockchain_to_disk(self):
+        """Saves the blockchain to disk using an atomic write."""
+        temp_file = Config.CHAIN_FILE + ".tmp"
+        with self.node_lock:
+            with open(temp_file, 'w') as f:
+                json.dump({"chain": self.chain}, f)
+            os.rename(temp_file, Config.CHAIN_FILE)
+
+    def load_blockchain_from_disk(self):
+        """Loads the blockchain from disk."""
+        if os.path.exists(Config.CHAIN_FILE):
+            with open(Config.CHAIN_FILE, 'r') as f:
                 data = json.load(f)
                 self.chain = data['chain']
-                self.utxo_set = data['utxo_set']
-                self.peers = data['peers']
-        except FileNotFoundError:
-            print("No existing blockchain found, starting fresh")
-    
+
     def run(self):
-        """Main run loop"""
-        print(f"Starting CubeSat Blockchain Node")
-        print(f"Node Address: {self.address}")
+        """Starts all node threads and runs forever."""
+        self.initialize()
         
-        # Load existing blockchain
-        self.load_blockchain()
-        
-        # Start threads
         threads = [
             threading.Thread(target=self.network_thread, daemon=True),
-            threading.Thread(target=self.blockchain_thread, daemon=True),
-            threading.Thread(target=self.telemetry_thread, daemon=True)
+            threading.Thread(target=self.blockchain_thread, daemon=True)
         ]
-        
-        for thread in threads:
-            thread.start()
-        
-        # Create genesis block if needed
-        if not self.chain:
-            genesis = {
-                'index': 0,
-                'timestamp': time.time(),
-                'transactions': [],
-                'previous_hash': '0' * 64,
-                'nonce': 0
-            }
-            genesis['hash'] = hashlib.sha256(
-                json.dumps(genesis, sort_keys=True).encode()
-            ).hexdigest()
-            self.chain.append(genesis)
+        for t in threads:
+            t.start()
+            
+        print("[SYSTEM] All threads started. Node is operational.")
         
         try:
-            # Main loop
-            while True:
-                # Example: Create a transaction every 30 seconds
-                if len(self.peers) > 0:
-                    recipient = self.peers[0]  # Send to first peer
-                    tx = self.create_transaction(recipient, 10.0)
-                    self.broadcast_transaction(tx)
-                
-                # Save blockchain periodically
-                self.save_blockchain()
-                
-                time.sleep(30)
-                
+            while self.running:
+                # Main thread can be used for a CLI or other top-level tasks
+                time.sleep(1)
         except KeyboardInterrupt:
-            print("\nShutting down...")
+            print("\n[SYSTEM] Shutdown signal received.")
             self.running = False
-            
-            # Save blockchain
-            self.save_blockchain()
-            
-            # Cleanup
-            GPIO.cleanup()
-            self.spi.close()
-            
-            print("Node stopped")
+            self.hardware.cleanup()
+            print("[SYSTEM] Node stopped.")
 
-def main():
-    """Main entry point"""
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+if __name__ == "__main__":
     node = BlockchainNode()
     node.run()
-
-if __name__ == "__main__":
-    main()
