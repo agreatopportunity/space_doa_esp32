@@ -25,6 +25,11 @@ from cryptography.exceptions import InvalidTag
 import RPi.GPIO as GPIO
 import spidev
 import smbus
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hmac
+from cryptography.hazmat.primitives import constant_time
+import os, secrets
+
 
 # =============================================================================
 # CONFIGURATION
@@ -63,6 +68,34 @@ class Config:
     KEY_FILE = "node_key.pem"
     KEY_PASSWORD = b"space-doa-is-secure" # Password to encrypt the private key on disk
 
+# ---------------------------- PROTOCOL / MESSAGES ----------------------------
+class MsgType:
+    TX = 1
+    BLOCK = 2
+    PING = 3
+    PONG = 4
+    INV = 5
+    GETBLOCK = 6
+    HELLO = 100
+    HELLO_ACK = 101
+
+WIRE_STRUCT = "!IIIB"   # ver(uint32), ts(uint32), seq(uint32), type(uint8)
+WIRE_HDR_LEN = 13
+MAX_MSG_SIZE = 2048     # safety cap for JSON payloads
+RX_WINDOW_SEC = Config.RX_WINDOW_SEC
+
+# Miner / schedulers (match ESP cadence)
+HELLO_RETRY_MS    = 3000
+PING_INTERVAL_MS  = 10000
+MINE_INTERVAL_SEC = 20
+MEMPOOL_MINE_MIN  = 3
+
+INV_ANNOUNCE_MS   = 30000
+REBROADCAST_MS    = 15000
+REB_TX_BURST      = 2
+POW_ZEROS         = Config.DIFFICULTY_LEADING_ZEROES  # leading zeros in hex
+PROTOCOL_VERSION  = Config.PROTOCOL_VERSION
+
 # =============================================================================
 # UTILITY & DATA STRUCTURES
 # =============================================================================
@@ -77,6 +110,8 @@ def to_hex(data: bytes) -> str:
 def from_hex(data_str: str) -> bytes:
     return bytes.fromhex(data_str)
 
+def to_hex_bytes(b: bytes) -> str: return b.hex()
+    
 class UTXO:
     def __init__(self, txid: str, index: int, amount: int, address: str):
         self.txid = txid
@@ -204,6 +239,141 @@ class CryptoLayer:
             return None
 
 # =============================================================================
+# SESSION / HANDSHAKE (Ephemeral ECDH -> HKDF -> AES-GCM session)
+# =============================================================================
+
+def within_window(ts: int) -> bool:
+    now = now_sec()
+    return not (ts > now + RX_WINDOW_SEC or ts + RX_WINDOW_SEC < now)
+
+def make_msg_nonce(prefix4: bytes, ts: int, seq: int) -> bytes:
+    # 4B prefix | 4B seq | 4B ts = 12 bytes
+    return prefix4 + struct.pack("!I", seq) + struct.pack("!I", ts)
+
+def hmac_sha256(key: bytes, data: bytes) -> bytes:
+    h = hmac.HMAC(key, hashes.SHA256())
+    h.update(data)
+    return h.finalize()
+
+def build_transcript(ver: int,
+                     idA33: bytes, ephA33: bytes, nonceA12: bytes, tsA: int,
+                     idB33: bytes, ephB33: bytes, nonceB12: bytes, tsB: int) -> bytes:
+    # Mirror ESP32 layout (ver, tsA, idA, ephA, nonceA, tsB, idB, ephB, nonceB)
+    return (
+        struct.pack("!I", ver) +
+        struct.pack("!I", tsA) + idA33 + ephA33 + nonceA12 +
+        struct.pack("!I", tsB) + idB33 + ephB33 + nonceB12
+    )
+
+def pubkey_compressed_from_obj(pub: ec.EllipticCurvePublicKey) -> bytes:
+    return pub.public_bytes(encoding=serialization.Encoding.X962,
+                            format=serialization.PublicFormat.CompressedPoint)
+
+def pubkey_from_compressed(pub33: bytes) -> ec.EllipticCurvePublicKey:
+    return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pub33)
+
+class Ephemeral:
+    def __init__(self):
+        self.priv: Optional[ec.EllipticCurvePrivateKey] = None
+        self.pub33: Optional[bytes] = None
+        self.nonce12: Optional[bytes] = None
+        self.have = False
+
+    def make(self):
+        if self.have: return
+        self.priv = ec.generate_private_key(ec.SECP256R1())
+        self.pub33 = pubkey_compressed_from_obj(self.priv.public_key())
+        self.nonce12 = secrets.token_bytes(12)
+        self.have = True
+
+class Session:
+    def __init__(self):
+        self.established = False
+        self.peer = (Config.ESP32_IP, Config.UDP_PORT)
+        self.k_enc: Optional[bytes] = None
+        self.k_mac: Optional[bytes] = None
+        self.nonce_prefix4: Optional[bytes] = None
+        self.rx_seq = 0
+        self.tx_seq = 0
+        self.last_rx_ts = 0
+        self.peer_id_pub33: Optional[bytes] = None
+
+g_eph = Ephemeral()
+g_sess = Session()
+
+def derive_session_keys(my_eph_priv: ec.EllipticCurvePrivateKey,
+                        peer_eph33: bytes,
+                        nonceA12: bytes, nonceB12: bytes,
+                        my_id33: bytes, peer_id33: bytes) -> Tuple[bytes, bytes, bytes]:
+    peer_pub = pubkey_from_compressed(peer_eph33)
+    shared = my_eph_priv.exchange(ec.ECDH(), peer_pub)  # 32B
+    salt = nonceA12 + nonceB12
+    info = (b"SPACE-DOA v2\x00" + my_id33 + peer_id33 + g_eph.pub33 + peer_eph33)
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=64, salt=salt, info=info)
+    okm = hkdf.derive(shared)  # 64 bytes
+    k_enc = okm[:32]
+    k_mac = okm[32:]
+    nonce_prefix4 = secrets.token_bytes(4)
+    return k_enc, k_mac, nonce_prefix4
+
+def pack_header(type_id: int, seq: int) -> Tuple[bytes, int, int]:
+    ts = now_sec()
+    hdr = struct.pack(WIRE_STRUCT, PROTOCOL_VERSION, ts, seq, type_id)
+    return hdr, ts, seq
+
+def send_hello(sock: socket.socket):
+    if not g_eph.have: g_eph.make()
+    my_id33 = pubkey_compressed_from_obj(node.crypto._public_key)  # uses your identity key
+    body = {
+        "id": node.crypto.to_hex_bytes(my_id33),
+        "eph": node.crypto.to_hex_bytes(g_eph.pub33),
+        "na":  node.crypto.to_hex_bytes(g_eph.nonce12),
+        "ts":  now_sec()
+    }
+    hdr, ts, _ = pack_header(MsgType.HELLO, 0)
+    pkt = hdr + json.dumps(body, separators=(',', ':')).encode()
+    sock.sendto(pkt, (Config.ESP32_IP, Config.UDP_PORT))
+    node._last_hello_ts = ts
+    # (ESP32 will reply with HELLO_ACK)
+
+def send_hello_ack(sock: socket.socket, from_addr, peer_id33: bytes, peer_eph33: bytes, peer_nonceA12: bytes, tsA: int):
+    if not g_eph.have: g_eph.make()
+    my_id33 = pubkey_compressed_from_obj(node.crypto._public_key)
+    k_enc, k_mac, nonce_prefix4 = derive_session_keys(g_eph.priv, peer_eph33, peer_nonceA12, g_eph.nonce12, my_id33, peer_id33)
+
+    tsB = now_sec()
+    transcript = build_transcript(PROTOCOL_VERSION, peer_id33, peer_eph33, peer_nonceA12, tsA,
+                                  my_id33, g_eph.pub33, g_eph.nonce12, tsB)
+    mac = hmac_sha256(k_mac, transcript)
+
+    body = {
+        "id": node.crypto.to_hex_bytes(my_id33),
+        "eph": node.crypto.to_hex_bytes(g_eph.pub33),
+        "nb":  node.crypto.to_hex_bytes(g_eph.nonce12),
+        "np":  node.crypto.to_hex_bytes(nonce_prefix4),
+        "mac": mac.hex(),
+        "ts":  tsB
+    }
+    hdr, _, _ = pack_header(MsgType.HELLO_ACK, 0)
+    pkt = hdr + json.dumps(body, separators=(',', ':')).encode()
+    sock.sendto(pkt, from_addr)
+
+    # Stage session (confirmed on first encrypted pkt)
+    g_sess.established = True
+    g_sess.peer = from_addr
+    g_sess.k_enc = k_enc
+    g_sess.k_mac = k_mac
+    g_sess.nonce_prefix4 = nonce_prefix4
+    g_sess.peer_id_pub33 = peer_id33
+    g_sess.rx_seq = 0
+    g_sess.tx_seq = 0
+    g_sess.last_rx_ts = 0
+
+# Convenience: hex<->bytes helpers onto CryptoLayer (non-breaking)
+def _to_hex_bytes(b: bytes) -> str: return b.hex()
+CryptoLayer.to_hex_bytes = staticmethod(_to_hex_bytes)
+
+# =============================================================================
 # HARDWARE LAYER
 # =============================================================================
 
@@ -270,6 +440,10 @@ class BlockchainNode:
     def __init__(self):
         self.crypto = CryptoLayer()
         self.hardware = Hardware()
+
+        self._bucket_tokens = Config.TOKEN_BUCKET_SIZE
+        self._bucket_last = now_sec()
+        self._sock = None  # filled by network_thread
         
         self.chain: List[Dict] = []
         self.mempool: List[Dict] = []
@@ -283,6 +457,17 @@ class BlockchainNode:
         self.token_bucket = Config.TOKEN_BUCKET_SIZE
         self.last_token_fill = now_sec()
 
+def bucket_allow(self) -> bool:
+    nowt = now_sec()
+    dt = nowt - self._bucket_last
+    if dt > 0:
+        self._bucket_tokens = min(Config.TOKEN_BUCKET_SIZE, self._bucket_tokens + dt*Config.TOKEN_BUCKET_RATE)
+        self._bucket_last = nowt
+    if self._bucket_tokens >= 1:
+        self._bucket_tokens -= 1
+        return True
+    return False
+    
     def initialize(self):
         """Initializes all components of the node."""
         self.crypto.initialize()
@@ -330,69 +515,239 @@ class BlockchainNode:
         print("[UTXO] Rebuild complete.")
 
 
-    def network_thread(self):
-        """Handles UDP communication for receiving messages."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind((Config.UDP_IP, Config.UDP_PORT))
-        print(f"[NET] UDP server listening on {Config.UDP_IP}:{Config.UDP_PORT}")
+def process_hello(from_addr, body: bytes):
+    try:
+        d = json.loads(body.decode())
+        idhex, ephhex, nhex, tsA = d.get("id"), d.get("eph"), d.get("na"), d.get("ts")
+        if not (idhex and ephhex and nhex and tsA): return
+        if not within_window(int(tsA)): return
+        peer_id33   = from_hex(idhex)
+        peer_eph33  = from_hex(ephhex)
+        peer_nonceA = from_hex(nhex)
+        # (Optionally check allowlist of peer identity here)
+        send_hello_ack(node._sock, from_addr, peer_id33, peer_eph33, peer_nonceA, int(tsA))
+    except Exception as e:
+        print(f"[HELLO] parse error: {e}")
 
-        while self.running:
-            try:
-                data, addr = sock.recvfrom(1024)
-                GPIO.output(Config.LED_RX, GPIO.HIGH)
-                
-                # --- Rate Limiting ---
-                current_time = now_sec()
-                time_passed = current_time - self.last_token_fill
-                self.token_bucket += time_passed * Config.TOKEN_BUCKET_RATE
-                if self.token_bucket > Config.TOKEN_BUCKET_SIZE:
-                    self.token_bucket = Config.TOKEN_BUCKET_SIZE
-                self.last_token_fill = current_time
+def process_hello_ack(from_addr, body: bytes):
+    try:
+        if not g_eph.have: return
+        d = json.loads(body.decode())
+        idhex, ephhex, nbhex, nphx, machex, tsB = d.get("id"), d.get("eph"), d.get("nb"), d.get("np"), d.get("mac"), d.get("ts")
+        if not (idhex and ephhex and nbhex and machex and nphx and tsB): return
+        if not within_window(int(tsB)): return
 
-                if self.token_bucket < 1:
-                    print(f"[NET] Rate limit exceeded for {addr}. Packet dropped.")
-                    continue
-                self.token_bucket -= 1
+        peer_id33  = from_hex(idhex)
+        peer_eph33 = from_hex(ephhex)
+        nonceB     = from_hex(nbhex)
+        mac_recv   = from_hex(machex)
+        nonce_pref = from_hex(nphx)
 
-                # --- Protocol Deserialization ---
-                if len(data) < 13: continue # Header is 13 bytes
-                ver, ts, seq, type_id = struct.unpack('!IIIB', data[:13])
-                
-                if ver != Config.PROTOCOL_VERSION: continue
+        my_id33 = pubkey_compressed_from_obj(node.crypto._public_key)
+        k_enc, k_mac, _junk = derive_session_keys(g_eph.priv, peer_eph33, g_eph.nonce12, nonceB, my_id33, peer_id33)
+        transcript = build_transcript(PROTOCOL_VERSION,
+                                      my_id33, g_eph.pub33, g_eph.nonce12, node._last_hello_ts,
+                                      peer_id33, peer_eph33, nonceB, int(tsB))
+        mac_calc = hmac_sha256(k_mac, transcript)
+        if not constant_time.bytes_eq(mac_calc, mac_recv):
+            print("[HELLO_ACK] MAC verify failed"); return
 
-                if not (now_sec() - Config.RX_WINDOW_SEC <= ts <= now_sec() + Config.RX_WINDOW_SEC):
-                    print(f"[NET] Stale packet from {addr}. Dropped.")
-                    continue
-                    
-                # --- Decryption ---
-                header = data[:13]
-                encrypted_payload = data[13:]
-                payload = self.crypto.aead_decrypt(encrypted_payload, header)
+        g_sess.established = True
+        g_sess.peer = from_addr
+        g_sess.k_enc = k_enc
+        g_sess.k_mac = k_mac
+        g_sess.nonce_prefix4 = nonce_pref
+        g_sess.peer_id_pub33 = peer_id33
+        g_sess.rx_seq = 0
+        g_sess.tx_seq = 0
+        g_sess.last_rx_ts = 0
+        print("[SESSION] established")
+    except Exception as e:
+        print(f"[HELLO_ACK] error: {e}")
 
-                if payload:
-                    message = json.loads(payload.decode())
-                    self.msg_queue.put({"type": type_id, "payload": message, "sender": addr})
+def poll_udp_once(sock: socket.socket):
+    # Non-blocking check
+    sock.settimeout(0.05)
+    try:
+        data, addr = sock.recvfrom(MAX_MSG_SIZE)
+    except socket.timeout:
+        return
+    except Exception as e:
+        print(f"[NET] recv error: {e}")
+        return
 
-                GPIO.output(Config.LED_RX, GPIO.LOW)
-            except Exception as e:
-                print(f"[NET] Network thread error: {e}")
+    # Basic token bucket (reuse your fields)
+    if not node.bucket_allow():
+        print(f"[NET] Rate limit exceeded for {addr}. Packet dropped.")
+        return
 
-    def blockchain_thread(self):
-        """Main thread for processing messages and managing the blockchain."""
-        while self.running:
-            try:
-                msg = self.msg_queue.get(timeout=1)
-                
-                if msg['type'] == 1: # Transaction
-                    self.handle_transaction(msg['payload'])
-                elif msg['type'] == 2: # Block
-                    self.handle_block(msg['payload'])
-                # Add handlers for PING, etc.
+    # Peek header quickly
+    if len(data) < WIRE_HDR_LEN:
+        return
+    ver, ts, seq, type_id = struct.unpack(WIRE_STRUCT, data[:WIRE_HDR_LEN])
 
-            except queue.Empty:
-                # No messages, try to mine a block
+    if type_id == MsgType.HELLO:
+        process_hello(addr, data[WIRE_HDR_LEN:])
+        return
+    if type_id == MsgType.HELLO_ACK:
+        process_hello_ack(addr, data[WIRE_HDR_LEN:])
+        return
+
+    if not g_sess.established:
+        return
+
+    out = recv_encrypted(data)
+    if not out:
+        return
+    _, pt, _ = out
+    try:
+        message = json.loads(pt.decode())
+        node.msg_queue.put({"type": type_id, "payload": message, "sender": addr})
+    except Exception as e:
+        print(f"[NET] payload parse error: {e}")
+
+def network_thread(self):
+    """Handles UDP I/O, handshake retries, ping, INV/rebroadcast timers."""
+    self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    self._sock.bind((Config.UDP_IP, Config.UDP_PORT))
+    print(f"[NET] UDP server listening on {Config.UDP_IP}:{Config.UDP_PORT}")
+
+    self._last_hello_ms = 0
+    self._last_ping_ms = 0
+    self._last_mine_ts = now_sec()
+    self._last_inv_ms = 0
+    self._last_reb_ms = 0
+    self._last_hello_ts = 0
+
+    # Kick off HELLO proactively
+    send_hello(self._sock); self._last_hello_ms = int(time.time()*1000)
+
+    while self.running:
+        # 1) UDP pump once
+        poll_udp_once(self._sock)
+
+        # 2) Handshake retry
+        now_ms = int(time.time()*1000)
+        if not g_sess.established and (now_ms - self._last_hello_ms) >= HELLO_RETRY_MS:
+            send_hello(self._sock)
+            self._last_hello_ms = now_ms
+
+        # 3) Keep-alive ping
+        if g_sess.established and (now_ms - self._last_ping_ms) >= PING_INTERVAL_MS:
+            send_encrypted(self._sock, MsgType.PING, b'{"ping":1}')
+            self._last_ping_ms = now_ms
+
+        # 4) INV announce
+        if g_sess.established and (now_ms - self._last_inv_ms) >= INV_ANNOUNCE_MS:
+            tip = len(self.chain)-1
+            tip_hash = self.chain[-1]['hash'] if self.chain else "0"*64
+            body = json.dumps({"tip": tip, "hash": tip_hash}, separators=(',', ':')).encode()
+            send_encrypted(self._sock, MsgType.INV, body)
+            self._last_inv_ms = now_ms
+
+        # 5) Mempool trickle rebroadcast
+        if g_sess.established and (now_ms - self._last_reb_ms) >= REBROADCAST_MS:
+            burst = 0
+            for tx in list(self.mempool)[:REB_TX_BURST]:
+                send_encrypted(self._sock, MsgType.TX,
+                               json.dumps(tx, separators=(',', ':')).encode())
+                burst += 1
+                if burst >= REB_TX_BURST: break
+            self._last_reb_ms = now_ms
+
+        # small sleep to keep CPU cool
+        time.sleep(0.005)
+
+
+def handle_block(self, b: Dict):
+    """Validate and append block (simple checks like ESP fast-path)."""
+    try:
+        # recompute merkle
+        mrk = self.calculate_merkle_root(b['transactions'])
+        if mrk != b['merkle_root']: 
+            print("[BLOCK] bad merkle"); return
+        # recompute header hash
+        h2 = self.hash_block(b)
+        if h2 != b.get('hash',''):
+            print("[BLOCK] bad header hash"); return
+        # pow check
+        if not b['hash'].startswith('0'*POW_ZEROS):
+            print("[BLOCK] pow fail"); return
+        # prev
+        if b['index'] != len(self.chain):
+            print("[BLOCK] height mismatch"); return
+        if b['index'] == 0:
+            if b['previous_hash'] != "0"*64: 
+                print("[BLOCK] bad genesis prev"); return
+        else:
+            if b['previous_hash'] != self.chain[-1]['hash']:
+                print("[BLOCK] prev mismatch"); return
+
+        # commit
+        self.chain.append(b)
+        # prune included tx from mempool
+        mined_ids = {tx['txid'] for tx in b['transactions'] if tx.get('txid')}
+        self.mempool = [t for t in self.mempool if t['txid'] not in mined_ids]
+        self.rebuild_utxo_set()
+        self.save_blockchain_to_disk()
+        GPIO.output(Config.LED_RX, GPIO.HIGH); GPIO.output(Config.LED_RX, GPIO.LOW)
+        print(f"[BLOCK] accepted h={b['index']} {b['hash'][:10]}...")
+    except Exception as e:
+        print(f"[BLOCK] error: {e}")
+
+def process_inv(self, payload: Dict):
+    peer_tip = int(payload.get("tip", 0))
+    peer_hash = payload.get("hash", "0"*64)
+    my_tip = len(self.chain)-1
+    my_hash = self.chain[-1]['hash'] if self.chain else "0"*64
+    if peer_tip > my_tip:
+        # ask next block
+        body = json.dumps({"from": my_tip+0, "count": 1}, separators=(',', ':')).encode()
+        send_encrypted(self._sock, MsgType.GETBLOCK, body)
+    elif peer_tip == my_tip and peer_hash != my_hash and my_tip > 0:
+        # height tie but different tip: ask one behind
+        body = json.dumps({"from": my_tip-1, "count": 2}, separators=(',', ':')).encode()
+        send_encrypted(self._sock, MsgType.GETBLOCK, body)
+
+def process_getblock(self, sender, payload: Dict):
+    start = int(payload.get("from", 0))
+    count = max(1, min(8, int(payload.get("count", 1))))
+    tip = len(self.chain)
+    for i in range(count):
+        idx = start + i
+        if idx >= tip: break
+        block_bytes = json.dumps(self.chain[idx], separators=(',', ':')).encode()
+        send_encrypted(self._sock, MsgType.BLOCK, block_bytes)
+
+def blockchain_thread(self):
+    """Main thread: route app messages, schedule mining."""
+    last_mine_ts = now_sec()
+    while self.running:
+        try:
+            msg = self.msg_queue.get(timeout=0.5)
+            t = msg['type']
+            p = msg['payload']
+            if t == MsgType.TX:
+                self.handle_transaction(p)
+            elif t == MsgType.BLOCK:
+                self.handle_block(p)
+            elif t == MsgType.INV:
+                self.process_inv(p)
+            elif t == MsgType.GETBLOCK:
+                self.process_getblock(msg['sender'], p)
+            elif t == MsgType.PING:
+                # cheap pong
+                send_encrypted(self._sock, MsgType.PONG, json.dumps({"pong":1}).encode())
+        except queue.Empty:
+            # miner cadence (time or mempool pressure)
+            nowt = now_sec()
+            due_time = (nowt - last_mine_ts) >= MINE_INTERVAL_SEC
+            due_pressure = len(self.mempool) >= MEMPOOL_MINE_MIN
+            if due_time or due_pressure:
                 self.attempt_mining()
-                continue
+                last_mine_ts = nowt
+            continue
+
 
     def handle_transaction(self, tx: Dict):
         """Validates and adds a transaction to the mempool."""
@@ -542,24 +897,57 @@ class BlockchainNode:
             
         return txids[0]
 
-    def broadcast_message(self, type_id: int, payload: Dict):
-        """Encrypts and broadcasts a message to known peers (ESP32)."""
-        try:
-            GPIO.output(Config.LED_TX, GPIO.HIGH)
-            payload_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
-            header = struct.pack('!IIIB', Config.PROTOCOL_VERSION, now_sec(), 0, type_id) # Seq 0 for now
-            
-            encrypted_packet = self.crypto.aead_encrypt(payload_bytes, header)
-            
-            if encrypted_packet:
-                full_packet = header + encrypted_packet
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.sendto(full_packet, (Config.ESP32_IP, Config.UDP_PORT))
-                print(f"[NET] Broadcasted message type {type_id} to {Config.ESP32_IP}")
-        except Exception as e:
-            print(f"[NET] Broadcast error: {e}")
-        finally:
-            GPIO.output(Config.LED_TX, GPIO.LOW)
+    def send_encrypted(sock: socket.socket, type_id: int, payload_bytes: bytes):
+    if not g_sess.established or not g_sess.k_enc: return False
+    if not node.bucket_allow():  # reuse your token bucket behavior
+        print("[RATE] drop (bucket)")
+        return False
+
+    g_sess.tx_seq += 1
+    hdr, ts, seq = pack_header(type_id, g_sess.tx_seq)
+    nonce = make_msg_nonce(g_sess.nonce_prefix4, ts, seq)
+
+    aes = AESGCM(g_sess.k_enc)
+    ct = aes.encrypt(nonce, payload_bytes, hdr)  # AAD = header
+    pkt = hdr + ct
+    sock.sendto(pkt, g_sess.peer)
+    GPIO.output(Config.LED_TX, GPIO.HIGH); GPIO.output(Config.LED_TX, GPIO.LOW)
+    return True
+
+def recv_encrypted(pkt: bytes) -> Optional[Tuple[int, bytes, Tuple[str,int]]]:
+    if len(pkt) < WIRE_HDR_LEN + 16: return None
+    ver, ts, seq, type_id = struct.unpack(WIRE_STRUCT, pkt[:WIRE_HDR_LEN])
+    if ver != PROTOCOL_VERSION or not within_window(ts): return None
+    if not g_sess.established or not g_sess.k_enc or not g_sess.nonce_prefix4: return None
+
+    # replay/order defense
+    if seq <= g_sess.rx_seq and ts <= g_sess.last_rx_ts:
+        return None
+
+    hdr = pkt[:WIRE_HDR_LEN]
+    ct  = pkt[WIRE_HDR_LEN:]
+    nonce = make_msg_nonce(g_sess.nonce_prefix4, ts, seq)
+    aes = AESGCM(g_sess.k_enc)
+    try:
+        pt = aes.decrypt(nonce, ct, hdr)
+    except InvalidTag:
+        return None
+
+    g_sess.rx_seq = seq
+    g_sess.last_rx_ts = ts
+    return (type_id, pt, None)  # addr filled by net thread
+
+def broadcast_message(self, type_id: int, payload: Dict):
+    """Encrypts and broadcasts to the current session peer."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        payload_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+        ok = send_encrypted(sock, type_id, payload_bytes)
+        if ok:
+            print(f"[NET] Encrypted send type {type_id} -> {g_sess.peer}")
+    except Exception as e:
+        print(f"[NET] Broadcast error: {e}")
+
 
     def save_blockchain_to_disk(self):
         """Saves the blockchain to disk using an atomic write."""
@@ -598,6 +986,7 @@ class BlockchainNode:
             self.running = False
             self.hardware.cleanup()
             print("[SYSTEM] Node stopped.")
+
 
 # =============================================================================
 # MAIN ENTRY POINT
