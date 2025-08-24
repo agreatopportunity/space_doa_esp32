@@ -395,7 +395,11 @@ static bool saveBlockToSD(const Block& b){
 // ------------------------------ NETWORK --------------------------------
 WiFiUDP g_udp;
 
-enum MsgType: uint8_t { MSG_TX=1, MSG_BLOCK=2, MSG_PING=3, MSG_PONG=4, MSG_HELLO=100, MSG_HELLO_ACK=101 };
+enum MsgType: uint8_t {
+  MSG_TX=1, MSG_BLOCK=2, MSG_PING=3, MSG_PONG=4,
+  MSG_INV=5, MSG_GETBLOCK=6,
+  MSG_HELLO=100, MSG_HELLO_ACK=101
+};
 
 #pragma pack(push,1)
 struct WireHeader {
@@ -950,8 +954,14 @@ static bool process_block_msg(const IPAddress& /*from*/, const uint8_t *body, si
 // Optional helper to route decrypted app messages
 static void process_app_msg(const IPAddress& from, MsgType type, const uint8_t* payload, size_t len){
   switch(type){
-    case MSG_TX:    process_tx_msg(from, payload, len);    break;
-    case MSG_BLOCK: process_block_msg(from, payload, len); break;
+    case MSG_TX:        process_tx_msg(from, payload, len);            break;
+    case MSG_BLOCK:     process_block_msg(from, payload, len);         break;
+    case MSG_INV:       process_inv_msg(from, payload, len);           break;
+    case MSG_GETBLOCK:  process_getblock_msg(from, payload, len);      break;
+    case MSG_PING: {
+      // cheap pong echo
+      send_encrypted(from, MSG_PONG, payload, len);
+    } break;
     default: /* ignore others here */ break;
   }
 }
@@ -1019,6 +1029,208 @@ static void miner_tick(){
     mine_block();
     g_lastMineTs = now;
   }
+}
+
+// ----------------------- INV / GETBLOCK / REBROADCAST -------------------
+static const uint32_t INV_ANNOUNCE_MS    = 30000;  // send tip inv every 30s
+static const uint32_t REBROADCAST_MS     = 15000;  // trickle mempool tx every 15s
+static const uint8_t  REB_TX_BURST       = 2;      // at most N per tick
+
+static uint32_t g_lastInvMs  = 0;
+static uint32_t g_lastRebMs  = 0;
+
+// Build current tip info (height + hash)
+static void get_tip(uint32_t &h, char outHash[65]){
+  xSemaphoreTake(g_chainMtx, portMAX_DELAY);
+  h = g_height;
+  if(g_height==0){ memset(outHash,'0',64); outHash[64]='\0'; }
+  else { strlcpy(outHash, g_chain[g_height-1].h.hash, 65); }
+  xSemaphoreGive(g_chainMtx);
+}
+
+// Send INV {tip, hash} as a tiny JSON body
+static void send_inv(){
+  if(!g_sess.established) return;
+  uint32_t h; char hh[65]; get_tip(h, hh);
+  char body[128];
+  snprintf(body, sizeof(body), "{\"tip\":%u,\"hash\":\"%s\"}", (unsigned)h, hh);
+  send_encrypted(g_sess.peer, MSG_INV, (const uint8_t*)body, strlen(body));
+}
+
+// Send GETBLOCK {from, count}, we’ll ask one-by-one to keep it simple
+static void send_getblock(uint32_t fromIdx, uint8_t count=1){
+  if(!g_sess.established) return;
+  char body[96];
+  snprintf(body, sizeof(body), "{\"from\":%u,\"count\":%u}", (unsigned)fromIdx, (unsigned)count);
+  send_encrypted(g_sess.peer, MSG_GETBLOCK, (const uint8_t*)body, strlen(body));
+}
+
+// Respond to GETBLOCK by streaming blocks
+static bool process_getblock_msg(const IPAddress& to, const uint8_t *body, size_t len){
+  // parse {"from":u32,"count":u8}
+  uint32_t from=0; uint32_t count=1;
+  // ultra-lightweight parse (avoid bringing a full JSON lib)
+  const char* s = (const char*)body;
+  sscanf(s, "{\"from\":%u", &from);
+  const char* cptr = strstr(s, "\"count\":");
+  if(cptr){ unsigned tmp=1; sscanf(cptr, "\"count\":%u", &tmp); count = tmp; }
+  if(count==0) count=1; if(count>8) count=8; // clamp
+
+  xSemaphoreTake(g_chainMtx, portMAX_DELAY);
+  uint32_t tip = g_height;
+  for(uint32_t i=0; i<count; i++){
+    uint32_t idx = from + i;
+    if(idx >= tip) break;
+    const Block &b = g_chain[idx];
+    std::vector<uint8_t> payload;
+    if(encode_block_payload(b, payload)){
+      send_encrypted(to, MSG_BLOCK, payload.data(), payload.size());
+    }
+  }
+  xSemaphoreGive(g_chainMtx);
+  return true;
+}
+
+// Handle INV: if their tip is ahead (or we have a mismatch), request next block
+static bool process_inv_msg(const IPAddress& from, const uint8_t *body, size_t len){
+  uint32_t peerTip=0; char peerHash[65]={0};
+  const char* s = (const char*)body;
+
+  // {"tip":123,"hash":"abcd..."}
+  sscanf(s, "{\"tip\":%u", &peerTip);
+  const char* hptr = strstr(s, "\"hash\":\"");
+  if(hptr){
+    hptr += 8; // skip "hash":" 
+    size_t i=0; while(i<64 && hptr[i] && hptr[i]!='"'){ peerHash[i]=hptr[i]; i++; }
+    peerHash[i]='\0';
+  }
+
+  // Decide if we need blocks
+  xSemaphoreTake(g_chainMtx, portMAX_DELAY);
+  uint32_t myTip = g_height;
+  char myHash[65];
+  if(myTip==0){ memset(myHash,'0',64); myHash[64]='\0'; }
+  else { strlcpy(myHash, g_chain[myTip-1].h.hash, 65); }
+  xSemaphoreGive(g_chainMtx);
+
+  if(peerTip > myTip){
+    // ask next block from our height
+    send_getblock(myTip, 1);
+  } else if(peerTip==myTip && strncmp(peerHash, myHash, 64)!=0){
+    // same height but different tip hash — simplest approach:
+    // request from one behind; peer will stream blocks (you can add a reorg handler later)
+    if(myTip>0) send_getblock(myTip-1, 2);
+  }
+  return true;
+}
+
+// Periodic mempool rebroadcast (trickle)
+static void rebroadcast_tick(){
+  if(!g_sess.established) return;
+  if(millis() - g_lastRebMs < REBROADCAST_MS) return;
+
+  uint8_t sent=0;
+  xSemaphoreTake(g_mempoolMtx, portMAX_DELAY);
+  for(uint16_t i=0; i<g_mempoolSize && sent<REB_TX_BURST; i++){
+    std::vector<uint8_t> p;
+    if(encode_tx_payload(g_mempool[i], p)){
+      send_encrypted(g_sess.peer, MSG_TX, p.data(), p.size());
+      sent++;
+    }
+  }
+  xSemaphoreGive(g_mempoolMtx);
+  g_lastRebMs = millis();
+}
+
+// Periodic INV announce
+static void inv_tick(){
+  if(!g_sess.established) return;
+  if(millis() - g_lastInvMs >= INV_ANNOUNCE_MS){
+    send_inv();
+    g_lastInvMs = millis();
+  }
+}
+
+
+// ============================== ARDUINO ================================
+static void init_mutexes(){
+  g_chainMtx   = xSemaphoreCreateMutex();
+  g_mempoolMtx = xSemaphoreCreateMutex();
+}
+
+void setup(){
+  Serial.begin(115200);
+  pinMode(LED_STATUS, OUTPUT);
+  pinMode(LED_TX, OUTPUT);
+  pinMode(LED_RX, OUTPUT);
+
+  // Identity + allowlist
+  g_id.init();
+  configurePeers();
+
+  // SD card (optional but recommended for journal/blocks)
+  if(!SD.begin(SD_CS)){ Serial.println("[SD] init failed"); } else { ensureChainDir(); }
+
+  // Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("[WiFi] connecting");
+  for(int i=0;i<60 && WiFi.status()!=WL_CONNECTED;i++){ delay(250); Serial.print("."); }
+  Serial.println();
+  if(WiFi.status()==WL_CONNECTED){
+    Serial.print("[WiFi] "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[WiFi] not connected — continuing anyway");
+  }
+
+  // UDP
+  g_udp.begin(UDP_PORT);
+  Serial.printf("[UDP] listening on %u\n", UDP_PORT);
+
+  // Mutexes
+  init_mutexes();
+
+  // Kick off optional HELLO to ground hint
+  uint32_t ts=0; send_hello(GROUND_HINT, &ts); g_lastHelloMs = millis();
+
+  // Baselines
+  g_lastPingMs = millis();
+  g_lastMineTs = nowSec();
+
+  // Watchdog (optional)
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+  esp_task_wdt_add(NULL);
+}
+
+void loop(){
+  // Retry handshake until we have a session
+  if(!g_sess.established){
+    if(millis() - g_lastHelloMs >= HELLO_RETRY_MS){
+      uint32_t ts=0; send_hello(GROUND_HINT, &ts);
+      g_lastHelloMs = millis();
+    }
+  } else {
+    // Keep-alive ping
+    if(millis() - g_lastPingMs >= PING_INTERVAL_MS){
+      const char pingBody[] = "{\"ping\":1}";
+      send_encrypted(g_sess.peer, MSG_PING, (const uint8_t*)pingBody, strlen(pingBody));
+      g_lastPingMs = millis();
+    }
+  }
+
+  // Pump one UDP packet (HELLO/ACK or encrypted app message)
+  poll_udp_once();
+
+  inv_tick();
+  rebroadcast_tick();
+
+  // Miner background work
+  miner_tick();
+
+  // Service WDT and yield
+  esp_task_wdt_reset();
+  delay(1);
+  
 }
 
 
