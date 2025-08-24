@@ -54,7 +54,7 @@ To get this firmware running on your own ESP32, follow these steps.
 
 1.  **Clone the repository:**
     ```sh
-    git clone [https://github.com/agreatopportunity/space_doa_esp32](https://github.com/agreatopportunity/space_doa_esp32)
+    git clone https://github.com/agreatopportunity/space_doa_esp32
     ```
 2.  **Open the project in VS Code:**
     * Open Visual Studio Code.
