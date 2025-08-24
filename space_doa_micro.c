@@ -955,3 +955,70 @@ static void process_app_msg(const IPAddress& from, MsgType type, const uint8_t* 
     default: /* ignore others here */ break;
   }
 }
+
+// ----------------------- UDP PUMP & SCHEDULERS -------------------------
+static const uint32_t HELLO_RETRY_MS     = 3000;   // retry handshake
+static const uint32_t PING_INTERVAL_MS   = 10000;  // keep-alive
+static const uint32_t MINE_INTERVAL_SEC  = 20;     // background cadence
+static const uint8_t  MEMPOOL_MINE_MIN   = 3;      // mine early if ≥N tx
+
+static uint32_t g_lastHelloMs = 0;
+static uint32_t g_lastPingMs  = 0;
+static uint32_t g_lastMineTs  = 0;
+
+// Poll one UDP packet, route to HELLO/ACK or decrypt + app dispatch
+static void poll_udp_once(){
+  int p = g_udp.parsePacket();
+  if(p <= 0) return;
+
+  IPAddress from = g_udp.remoteIP();
+  static uint8_t buf[sizeof(WireHeader) + MAX_MSG_SIZE + 16];
+  size_t len = g_udp.read(buf, sizeof(buf));
+  if(len < sizeof(WireHeader)) return;
+
+  // Peek header to decide path
+  WireHeader wh; memcpy(&wh, buf, sizeof(WireHeader));
+
+  if(wh.type == MSG_HELLO){
+    // plain-text hello
+    const uint8_t* body = buf + sizeof(WireHeader);
+    size_t blen = (len > sizeof(WireHeader)) ? (len - sizeof(WireHeader)) : 0;
+    process_hello(from, body, blen);
+    return;
+  }
+  if(wh.type == MSG_HELLO_ACK){
+    // plain-text hello-ack
+    const uint8_t* body = buf + sizeof(WireHeader);
+    size_t blen = (len > sizeof(WireHeader)) ? (len - sizeof(WireHeader)) : 0;
+    process_hello_ack(from, body, blen);
+    return;
+  }
+
+  // Everything else must be encrypted
+  if(!g_sess.established) return;
+
+  MsgType mt; std::vector<uint8_t> payload;
+  if(!recv_encrypted(from, buf, len, mt, payload)) return;
+  process_app_msg(from, mt, payload.data(), payload.size());
+}
+
+// Lightweight miner trigger (time-based or mempool pressure)
+static void miner_tick(){
+  uint32_t now = nowSec();
+
+  // trigger by time
+  bool due_time = (now - g_lastMineTs) >= MINE_INTERVAL_SEC;
+
+  // trigger by mempool size
+  bool due_pressure = false;
+  xSemaphoreTake(g_mempoolMtx, portMAX_DELAY);
+  if(g_mempoolSize >= MEMPOOL_MINE_MIN) due_pressure = true;
+  xSemaphoreGive(g_mempoolMtx);
+
+  if(due_time || due_pressure){
+    mine_block();
+    g_lastMineTs = now;
+  }
+}
+
+
