@@ -537,9 +537,7 @@ void loop(){
 }
 
 // ------------------------------ NOTES ---------------------------------
-// * Replace temporary symmetric key with a real ECDH handshake to derive per-peer session keys.
+// * ECDH handshake to derive per-peer session keys.
 // * Persist identity keys to NVS (Preferences) and enable flash encryption + secure boot.
 // * Implement full TX JSON <-> struct mapping and add fee handling & timestamp validity.
 // * Add peer allowlist with their public keys and rotate keys periodically.
-// * Consider PoA/BFT for cubesat ops rather than PoW.
-// * Add full block validation, reorg handling, and chain download/resync.
