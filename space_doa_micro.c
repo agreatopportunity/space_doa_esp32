@@ -1,7 +1,7 @@
 /**
  * SPACE DOA - CubeSat Blockchain Controller
  * ESP32 Production-Ready Firmware
- * Version: 3.0.0
+ * Version: 3.0.1
  *
  * This firmware is a hardened implementation for a lightweight blockchain node
  * intended for deployment on a CubeSat in Low Earth Orbit (LEO).
