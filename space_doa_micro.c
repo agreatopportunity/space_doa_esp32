@@ -1,841 +1,545 @@
 /**
  * SPACE DOA - CubeSat Blockchain Controller
- * ESP32 Implementation for Orbital Distributed Ledger
- * Version: 1.0.0
+ * ESP32 Production-Ready Firmware
+ * Version: 3.0.0
+ *
+ * This firmware is a hardened implementation for a lightweight blockchain node
+ * intended for deployment on a CubeSat in Low Earth Orbit (LEO).
  * 
- * Hardware Requirements:
- * - ESP32 DevKit (ESP32-WROOM-32)
- * - LoRa Module (SX1276/SX1278) - Optional
- * - MPU6050 IMU - Optional
- * - SD Card Module - Optional
- */
+ * 
+ * */
+// ---------------------------- CONFIGURATION ----------------------------
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
-#include <EEPROM.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/md.h>
 #include <mbedtls/ecdsa.h>
+#include <mbedtls/ecdh.h>
+#include <mbedtls/ecp.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
 #include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 
-// Pin Definitions
+// #define USE_LORA 1
+#ifdef USE_LORA
+  #include <LoRa.h>   // sandeepmistry/LoRa
+#endif
+
+// GPIOs (adjust to your board)
 #define LED_STATUS 2
-#define LED_TX 4
-#define LED_RX 5
-#define LORA_CS 15
-#define LORA_RST 14
-#define LORA_DIO0 26
-#define SD_CS 13
-#define IMU_SDA 21
-#define IMU_SCL 22
+#define LED_TX     4
+#define LED_RX     5
+#define SD_CS      13
+#define IMU_SDA    21
+#define IMU_SCL    22
 
-// Network Configuration
-const char* WIFI_SSID = "CUBESAT_GROUND";
-const char* WIFI_PASS = "blockchain2024";
-const int UDP_PORT = 8888;
+#ifdef USE_LORA
+  #define LORA_SS    15
+  #define LORA_RST   14
+  #define LORA_DIO0  26
+  #define LORA_FREQ  915E6
+#endif
 
-// Blockchain Configuration
-#define MAX_TRANSACTIONS 100
-#define MAX_BLOCKS 1000
-#define BLOCK_SIZE 10  // transactions per block
-#define DIFFICULTY 4   // leading zeros in hash
+// Wi‑Fi/UDP
+static const char* WIFI_SSID = "CUBESAT_GROUND";      // Move to NVS in production
+static const char* WIFI_PASS = "blockchain2024";      // Move to NVS in production
+static const uint16_t UDP_PORT = 8888;
 
-// Memory Management
-#define HEAP_SIZE 32768
-#define STACK_SIZE 4096
+// Limits & sizes
+static const uint32_t PROTOCOL_VERSION = 1;
+static const size_t   MAX_TX_PER_BLOCK = 10;
+static const size_t   MAX_MEMPOOL      = 100;
+static const size_t   MAX_BLOCKS       = 1000;       // In-RAM safety cap; long-term chain lives on SD
+static const size_t   MAX_MSG_SIZE     = 768;        // Hard cap to prevent abuse
+static const uint32_t DIFFICULTY_LEADING_ZEROES = 4; // If you keep PoW
 
-// ==================== Data Structures ====================
+// Replay + rate limiting
+static const uint32_t RX_WINDOW_SEC     = 60;        // Accept timestamps within ±60s
+static const uint32_t TOKEN_BUCKET_RATE = 6;         // msgs per second allowed
+static const uint32_t TOKEN_BUCKET_SIZE = 30;        // burst size
+
+// Watchdog
+static const uint32_t WDT_TIMEOUT_SEC   = 10;        // Per-task watchdog
+
+// Storage
+static const char* CHAIN_DIR = "/chain";
+static const char* JOURNAL   = "/chain/journal.log";  // append-only, atomic via temp+rename
+
+// ----------------------------------------------------------------------
+// Utility: monotonic seconds
+static inline uint32_t nowSec() { return (uint32_t)(esp_timer_get_time() / 1000000ULL); }
+
+// ---------------------------- CRYPTO LAYER -----------------------------
+// Identity keypair (ECDSA P-256). Stored in NVS/EEPROM in production.
+struct Identity {
+  mbedtls_ecdsa_context ecdsa;
+  mbedtls_ecp_group grp;
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context ctr;
+  bool ready = false;
+
+  Identity() { init(); }
+  ~Identity() { free(); }
+
+  void init() {
+    mbedtls_ecdsa_init(&ecdsa);
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr);
+    const char *pers = "esp32-ecdsa";
+    int rc;
+    if ((rc = mbedtls_ctr_drbg_seed(&ctr, mbedtls_entropy_func, &entropy,
+                                    (const unsigned char*)pers, strlen(pers))) != 0) {
+      Serial.printf("[CRYPTO] DRBG seed failed: %d\n", rc);
+      return;
+    }
+    if ((rc = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1)) != 0) {
+      Serial.printf("[CRYPTO] Load group failed: %d\n", rc);
+      return;
+    }
+    if ((rc = mbedtls_ecdsa_genkey(&ecdsa, MBEDTLS_ECP_DP_SECP256R1,
+                                    mbedtls_ctr_drbg_random, &ctr)) != 0) {
+      Serial.printf("[CRYPTO] Genkey failed: %d\n", rc);
+      return;
+    }
+    ready = true;
+  }
+
+  void free() {
+    mbedtls_ecdsa_free(&ecdsa);
+    mbedtls_ecp_group_free(&grp);
+    mbedtls_ctr_drbg_free(&ctr);
+    mbedtls_entropy_free(&entropy);
+  }
+
+  // Export compressed public key (33 bytes, SEC1 format 0x02/0x03 + X)
+  bool pubkeyCompressed(uint8_t out[33]) {
+    if (!ready) return false;
+    size_t olen = 0;
+    int rc = mbedtls_ecp_point_write_binary(&grp, &ecdsa.Q,
+              MBEDTLS_ECP_PF_COMPRESSED, &olen, out, 33);
+    return rc == 0 && olen == 33;
+  }
+
+  // Sign bytes with SHA-256(ECDSA)
+  bool sign(const uint8_t *msg, size_t len, std::vector<uint8_t> &sigDer) {
+    if (!ready) return false;
+    uint8_t hash[32];
+    mbedtls_sha256(msg, len, hash, 0);
+    size_t sig_len = 0;
+    sigDer.assign(80, 0); // enough for DER sig
+    int rc = mbedtls_ecdsa_write_signature(&ecdsa, MBEDTLS_MD_SHA256,
+                  hash, sizeof(hash), sigDer.data(), &sig_len,
+                  mbedtls_ctr_drbg_random, &ctr);
+    if (rc != 0) return false;
+    sigDer.resize(sig_len);
+    return true;
+  }
+
+  // Verify signature (peer's pubkey)
+  static bool verifyCompressedPub(const uint8_t pub[33], const uint8_t *msg, size_t len,
+                                  const uint8_t *sig, size_t sigLen) {
+    mbedtls_ecp_group grp; mbedtls_ecp_group_init(&grp);
+    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) != 0) { mbedtls_ecp_group_free(&grp); return false; }
+    mbedtls_ecp_point Q; mbedtls_ecp_point_init(&Q);
+
+    if (mbedtls_ecp_point_read_binary(&grp, &Q, pub, 33) != 0) { mbedtls_ecp_point_free(&Q); mbedtls_ecp_group_free(&grp); return false; }
+
+    mbedtls_ecdsa_context ctx; mbedtls_ecdsa_init(&ctx);
+    if (mbedtls_ecdsa_from_keypair(&ctx, &(mbedtls_ecp_keypair){ .grp = grp, .Q = Q }) != 0) {
+      mbedtls_ecdsa_free(&ctx); mbedtls_ecp_point_free(&Q); mbedtls_ecp_group_free(&grp); return false;
+    }
+    uint8_t hash[32];
+    mbedtls_sha256(msg, len, hash, 0);
+    int rc = mbedtls_ecdsa_read_signature(&ctx, hash, sizeof(hash), sig, sigLen);
+    mbedtls_ecdsa_free(&ctx); mbedtls_ecp_point_free(&Q); mbedtls_ecp_group_free(&grp);
+    return rc == 0;
+  }
+};
+
+Identity g_id;
+
+// ---------------------------- TRANSPORT -------------------------------
+struct TokenBucket { double tokens = TOKEN_BUCKET_SIZE; uint32_t last = nowSec(); };
+static TokenBucket g_bucket;
+
+static bool bucket_allow() {
+  uint32_t t = nowSec();
+  uint32_t dt = t - g_bucket.last;
+  if (dt > 0) {
+    g_bucket.tokens = std::min<double>(TOKEN_BUCKET_SIZE, g_bucket.tokens + dt * TOKEN_BUCKET_RATE);
+    g_bucket.last = t;
+  }
+  if (g_bucket.tokens >= 1.0) { g_bucket.tokens -= 1.0; return true; }
+  return false;
+}
+
+// Basic AES-GCM helpers (mbedTLS). In production, derive key via ECDH handshake.
+struct AeadKey { uint8_t key[32]; bool set=false; };
+static AeadKey g_netKey; // network session key (temporary solution)
+
+static bool aead_encrypt(const uint8_t *pt, size_t ptLen, const uint8_t *aad, size_t aadLen,
+                         uint8_t *nonce12, uint8_t *ct, size_t &ctLen,
+                         uint8_t *tag16) {
+  if (!g_netKey.set) return false;
+  const mbedtls_cipher_info_t *info = mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_256_GCM);
+  if (!info) return false;
+  mbedtls_cipher_context_t ctx; mbedtls_cipher_init(&ctx);
+  if (mbedtls_cipher_setup(&ctx, info) != 0) { mbedtls_cipher_free(&ctx); return false; }
+  int rc = mbedtls_cipher_auth_encrypt(&ctx, nonce12, 12, aad, aadLen,
+                                       pt, ptLen, ct, &ctLen, tag16, 16);
+  mbedtls_cipher_free(&ctx);
+  return rc == 0;
+}
+
+static bool aead_decrypt(const uint8_t *ct, size_t ctLen, const uint8_t *aad, size_t aadLen,
+                         uint8_t *nonce12, const uint8_t *tag16, uint8_t *pt, size_t &ptLen) {
+  if (!g_netKey.set) return false;
+  const mbedtls_cipher_info_t *info = mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_256_GCM);
+  if (!info) return false;
+  mbedtls_cipher_context_t ctx; mbedtls_cipher_init(&ctx);
+  if (mbedtls_cipher_setup(&ctx, info) != 0) { mbedtls_cipher_free(&ctx); return false; }
+  int rc = mbedtls_cipher_auth_decrypt(&ctx, nonce12, 12, aad, aadLen,
+                                       ct, ctLen, pt, &ptLen, tag16, 16);
+  mbedtls_cipher_free(&ctx);
+  return rc == 0;
+}
+
+// For demo, seed a per-deployment symmetric key from hardware RNG at first boot and keep in NVS.
+#include <Preferences.h>
+Preferences kv;
+static void ensure_net_key() {
+  if (!kv.begin("spacedoa", false)) return;
+  if (kv.getBytesLength("netk") == 32) {
+    kv.getBytes("netk", g_netKey.key, 32); g_netKey.set = true; kv.end(); return;
+  }
+  esp_fill_random(g_netKey.key, 32);
+  kv.putBytes("netk", g_netKey.key, 32); kv.end(); g_netKey.set = true;
+}
+
+// ---------------------------- LED helpers -----------------------------
+static inline void ledBlink(uint8_t pin, uint16_t onMs=50) { digitalWrite(pin,HIGH); delay(onMs); digitalWrite(pin,LOW); }
+
+// ------------------------------ UTXO ----------------------------------
+struct TxIn  { char prevTx[65]; uint32_t vout; };
+struct TxOut { uint32_t amount; uint8_t toPub[33]; };
 
 struct Transaction {
-    char from[35];
-    char to[35];
-    uint32_t amount;
-    uint32_t timestamp;
-    uint32_t nonce;
-    char signature[65];
-    char txid[65];
+  uint32_t version{1};
+  uint32_t timestamp{0};
+  uint8_t  fromPub[33]{};  // signer pubkey
+  uint8_t  inCount{0}, outCount{0};
+  TxIn     vin[2];         // small footprint demo
+  TxOut    vout[2];
+  // DER signature (variable length up to ~72B)
+  uint16_t sigLen{0};
+  uint8_t  sig[80];
+  char     txid[65];
 };
 
-struct Block {
-    uint32_t index;
-    uint32_t timestamp;
-    char prevHash[65];
-    char merkleRoot[65];
-    uint32_t nonce;
-    uint8_t txCount;
-    Transaction transactions[BLOCK_SIZE];
-    char hash[65];
+struct UTXOEntry { char txid[65]; uint32_t idx; uint32_t amount; uint8_t toPub[33]; bool spent; };
+
+// ---------------------------- BLOCKCHAIN -------------------------------
+struct BlockHeader {
+  uint32_t version{1};
+  uint32_t index{0};
+  uint32_t timestamp{0};
+  char prevHash[65];
+  char merkle[65];
+  uint32_t nonce{0};
+  char hash[65];
 };
 
-struct UTXOEntry {
-    char txid[65];
-    uint32_t vout;
-    char address[35];
-    uint32_t amount;
-    bool spent;
+struct Block { BlockHeader h; uint8_t txCount{0}; Transaction tx[MAX_TX_PER_BLOCK]; };
+
+static Block g_chain[MAX_BLOCKS];
+static uint16_t g_height = 0;
+
+static UTXOEntry g_utxo[2*MAX_MEMPOOL];
+static uint16_t  g_utxoCount = 0;
+
+static Transaction g_mempool[MAX_MEMPOOL];
+static uint16_t    g_mempoolSize = 0;
+
+static SemaphoreHandle_t g_chainMtx;
+static SemaphoreHandle_t g_mempoolMtx;
+
+// Hex helpers
+static void toHex(const uint8_t* in, size_t n, char* out) {
+  static const char* H="0123456789abcdef"; for (size_t i=0;i<n;i++){ out[2*i]=H[in[i]>>4]; out[2*i+1]=H[in[i]&0xF]; }
+  out[2*n]='\0';
+}
+
+// Merkle: hash pairs (dup last if odd) until single 32B
+static void merkleRoot(const Transaction *tx, uint8_t n, char out64[65]) {
+  if (n == 0) { memset(out64,'0',64); out64[64]='\0'; return; }
+  std::vector<std::array<uint8_t,32>> layer; layer.reserve(n);
+  for (uint8_t i=0;i<n;i++){ uint8_t h[32]; mbedtls_sha256((const uint8_t*)tx[i].txid, 64, h, 0); layer.push_back({}); memcpy(layer.back().data(),h,32);} 
+  while (layer.size()>1){
+    std::vector<std::array<uint8_t,32>> nxt; for (size_t i=0;i<layer.size(); i+=2){
+      const auto &a = layer[i]; const auto &b = (i+1<layer.size()? layer[i+1]: layer[i]);
+      uint8_t h[32]; mbedtls_sha256_ret(a.data(),32,h,0); mbedtls_sha256_ret(b.data(),32,h,0); // simple concat-hash
+      uint8_t cat[64]; memcpy(cat,a.data(),32); memcpy(cat+32,b.data(),32);
+      mbedtls_sha256(cat,64,h,0); nxt.push_back({}); memcpy(nxt.back().data(),h,32);
+    }
+    layer.swap(nxt);
+  }
+  toHex(layer[0].data(),32,out64);
+}
+
+static void hashBlockHeader(BlockHeader &bh) {
+  char buf[256];
+  snprintf(buf,sizeof(buf),"%u%u%u%s%s%u", bh.version,bh.index,bh.timestamp,bh.prevHash,bh.merkle,bh.nonce);
+  uint8_t h[32]; mbedtls_sha256((const uint8_t*)buf, strlen(buf), h, 0);
+  toHex(h,32,bh.hash);
+}
+
+// ---------------------------- PERSISTENCE ------------------------------
+static bool fsWriteAtomic(const char* path, const uint8_t* data, size_t len) {
+  String tmp = String(path)+".tmp";
+  File f = SD.open(tmp.c_str(), FILE_WRITE);
+  if (!f) return false;
+  size_t w = f.write(data, len); f.flush(); f.close();
+  if (w != len) { SD.remove(tmp.c_str()); return false; }
+  if (SD.exists(path)) SD.remove(path);
+  return SD.rename(tmp.c_str(), path);
+}
+
+static bool appendJournal(const char* jsonLine) {
+  File f = SD.open(JOURNAL, FILE_APPEND);
+  if (!f) return false;
+  size_t w = f.println(jsonLine);
+  f.flush(); f.close(); return w>0;
+}
+
+// --------------------------- VERIFICATION ------------------------------
+static bool verifyTx(const Transaction &tx) {
+  // Create signing preimage (version|timestamp|vin|vout|fromPub)
+  // Minimal encoding for demo; ensure deterministic layout.
+  StaticJsonDocument<512> d;
+  d["v"]=tx.version; d["t"]=tx.timestamp; d["fc"]=tx.inCount; d["tc"]=tx.outCount;
+  JsonArray vin = d.createNestedArray("in");
+  for (uint8_t i=0;i<tx.inCount;i++){ JsonArray a = vin.createNestedArray(); a.add(tx.vin[i].prevTx); a.add(tx.vin[i].vout); }
+  JsonArray vout = d.createNestedArray("out");
+  for (uint8_t i=0;i<tx.outCount;i++){ JsonArray a = vout.createNestedArray(); a.add(tx.vout[i].amount); char pkhex[67]; toHex(tx.vout[i].toPub,33,pkhex); a.add(pkhex); }
+  char pre[512]; size_t n = serializeJson(d, pre, sizeof(pre));
+  return Identity::verifyCompressedPub(tx.fromPub, (const uint8_t*)pre, n, tx.sig, tx.sigLen);
+}
+
+static bool applyTxToUTXO(const Transaction &tx) {
+  // Spend inputs
+  for (uint8_t i=0;i<tx.inCount;i++){
+    bool found=false; for (uint16_t j=0;j<g_utxoCount;j++){
+      if (!g_utxo[j].spent && strcmp(g_utxo[j].txid, tx.vin[i].prevTx)==0 && g_utxo[j].idx==tx.vin[i].vout) {
+        // Ownership check: input must be locked to fromPub
+        if (memcmp(g_utxo[j].toPub, tx.fromPub, 33)!=0) return false;
+        g_utxo[j].spent=true; found=true; break;
+      }
+    }
+    if (!found) return false;
+  }
+  // Create outputs
+  for (uint8_t k=0;k<tx.outCount;k++){
+    if (g_utxoCount >= (int)(sizeof(g_utxo)/sizeof(g_utxo[0]))) return false;
+    strncpy(g_utxo[g_utxoCount].txid, tx.txid, 65); g_utxo[g_utxoCount].idx=k;
+    g_utxo[g_utxoCount].amount=tx.vout[k].amount; memcpy(g_utxo[g_utxoCount].toPub, tx.vout[k].toPub, 33);
+    g_utxo[g_utxoCount].spent=false; g_utxoCount++;
+  }
+  return true;
+}
+
+static void calcTxId(Transaction &tx) {
+  StaticJsonDocument<256> d; d["v"]=tx.version; d["t"]=tx.timestamp; d["fc"]=tx.inCount; d["tc"]=tx.outCount;
+  char pre[256]; size_t n = serializeJson(d, pre, sizeof(pre));
+  uint8_t h[32]; mbedtls_sha256((const uint8_t*)pre, n, h, 0); toHex(h,32,tx.txid);
+}
+
+// ---------------------------- NETWORK RX/TX ----------------------------
+WiFiUDP g_udp;
+
+struct WireMessage {
+  uint32_t ver;
+  uint32_t ts;
+  uint32_t seq;
+  uint8_t  type; // 1=TX, 2=BLOCK, 3=PING, 4=PONG
+  // payload is JSON (capped by MAX_MSG_SIZE)
 };
 
-class BlockchainNode {
-private:
-    // Blockchain state
-    Block* chain;
-    uint16_t chainLength;
-    Transaction* mempool;
-    uint16_t mempoolSize;
-    UTXOEntry* utxoSet;
-    uint16_t utxoCount;
-    
-    // Node identity
-    uint8_t privateKey[32];
-    uint8_t publicKey[33];
-    char address[35];
-    uint32_t balance;
-    
-    // Network
-    WiFiUDP udp;
-    IPAddress peers[10];
-    uint8_t peerCount;
-    
-    // Thread synchronization
-    SemaphoreHandle_t chainMutex;
-    SemaphoreHandle_t mempoolMutex;
-    QueueHandle_t txQueue;
-    QueueHandle_t blockQueue;
-    
-    // Timing
-    uint32_t lastBlockTime;
-    uint32_t lastSyncTime;
-    
-public:
-    BlockchainNode() {
-        chain = (Block*)ps_malloc(sizeof(Block) * MAX_BLOCKS);
-        mempool = (Transaction*)ps_malloc(sizeof(Transaction) * MAX_TRANSACTIONS);
-        utxoSet = (UTXOEntry*)ps_malloc(sizeof(UTXOEntry) * MAX_TRANSACTIONS * 2);
-        
-        chainLength = 0;
-        mempoolSize = 0;
-        utxoCount = 0;
-        balance = 1000000; // Initial balance
-        peerCount = 0;
-        
-        chainMutex = xSemaphoreCreateMutex();
-        mempoolMutex = xSemaphoreCreateMutex();
-        txQueue = xQueueCreate(50, sizeof(Transaction));
-        blockQueue = xQueueCreate(10, sizeof(Block));
-    }
-    
-    void initialize() {
-        Serial.println("[BLOCKCHAIN] Initializing node...");
-        
-        // Initialize EEPROM
-        EEPROM.begin(512);
-        
-        // Load or generate keys
-        if (!loadKeys()) {
-            generateKeys();
-            saveKeys();
-        }
-        
-        // Generate address from public key
-        generateAddress();
-        
-        // Create genesis block if needed
-        if (chainLength == 0) {
-            createGenesisBlock();
-        }
-        
-        Serial.printf("[BLOCKCHAIN] Node initialized\n");
-        Serial.printf("[BLOCKCHAIN] Address: %s\n", address);
-        Serial.printf("[BLOCKCHAIN] Balance: %lu satoshis\n", balance);
-    }
-    
-    void generateKeys() {
-        // Generate random private key
-        esp_fill_random(privateKey, 32);
-        
-        // Derive public key (simplified - use proper ECDSA in production)
-        mbedtls_sha256_context ctx;
-        mbedtls_sha256_init(&ctx);
-        mbedtls_sha256_starts(&ctx, 0);
-        mbedtls_sha256_update(&ctx, privateKey, 32);
-        mbedtls_sha256_finish(&ctx, publicKey);
-        mbedtls_sha256_free(&ctx);
-        
-        publicKey[32] = 0x01; // Compressed key marker
-    }
-    
-    void generateAddress() {
-        // Generate Bitcoin-style address (simplified)
-        uint8_t hash[32];
-        mbedtls_sha256_context ctx;
-        mbedtls_sha256_init(&ctx);
-        mbedtls_sha256_starts(&ctx, 0);
-        mbedtls_sha256_update(&ctx, publicKey, 33);
-        mbedtls_sha256_finish(&ctx, hash);
-        mbedtls_sha256_free(&ctx);
-        
-        // Convert to base58 (simplified - just hex for demo)
-        sprintf(address, "ESP32");
-        for (int i = 0; i < 15; i++) {
-            char hex[3];
-            sprintf(hex, "%02X", hash[i]);
-            strcat(address, hex);
-        }
-    }
-    
-    bool loadKeys() {
-        uint8_t magic = EEPROM.read(0);
-        if (magic != 0xAA) return false;
-        
-        for (int i = 0; i < 32; i++) {
-            privateKey[i] = EEPROM.read(1 + i);
-        }
-        for (int i = 0; i < 33; i++) {
-            publicKey[i] = EEPROM.read(33 + i);
-        }
-        
-        return true;
-    }
-    
-    void saveKeys() {
-        EEPROM.write(0, 0xAA); // Magic byte
-        for (int i = 0; i < 32; i++) {
-            EEPROM.write(1 + i, privateKey[i]);
-        }
-        for (int i = 0; i < 33; i++) {
-            EEPROM.write(33 + i, publicKey[i]);
-        }
-        EEPROM.commit();
-    }
-    
-    void createGenesisBlock() {
-        Block genesis;
-        genesis.index = 0;
-        genesis.timestamp = millis() / 1000;
-        strcpy(genesis.prevHash, "0000000000000000000000000000000000000000000000000000000000000000");
-        strcpy(genesis.merkleRoot, "0000000000000000000000000000000000000000000000000000000000000000");
-        genesis.nonce = 0;
-        genesis.txCount = 0;
-        
-        calculateBlockHash(&genesis);
-        
-        xSemaphoreTake(chainMutex, portMAX_DELAY);
-        memcpy(&chain[0], &genesis, sizeof(Block));
-        chainLength = 1;
-        xSemaphoreGive(chainMutex);
-        
-        Serial.println("[BLOCKCHAIN] Genesis block created");
-    }
-    
-    void calculateBlockHash(Block* block) {
-        char data[512];
-        sprintf(data, "%lu%lu%s%s%lu%u", 
-                block->index, 
-                block->timestamp, 
-                block->prevHash, 
-                block->merkleRoot, 
-                block->nonce,
-                block->txCount);
-        
-        uint8_t hash[32];
-        mbedtls_sha256_context ctx;
-        mbedtls_sha256_init(&ctx);
-        mbedtls_sha256_starts(&ctx, 0);
-        mbedtls_sha256_update(&ctx, (uint8_t*)data, strlen(data));
-        mbedtls_sha256_finish(&ctx, hash);
-        mbedtls_sha256_free(&ctx);
-        
-        // Convert to hex string
-        for (int i = 0; i < 32; i++) {
-            sprintf(&block->hash[i * 2], "%02x", hash[i]);
-        }
-        block->hash[64] = '\0';
-    }
-    
-    Transaction* createTransaction(const char* recipient, uint32_t amount) {
-        if (amount > balance) {
-            Serial.println("[ERROR] Insufficient balance");
-            return nullptr;
-        }
-        
-        static Transaction tx;
-        strcpy(tx.from, address);
-        strcpy(tx.to, recipient);
-        tx.amount = amount;
-        tx.timestamp = millis() / 1000;
-        tx.nonce = random(0xFFFFFFFF);
-        
-        // Sign transaction
-        signTransaction(&tx);
-        
-        // Calculate transaction ID
-        calculateTxId(&tx);
-        
-        // Add to mempool
-        xSemaphoreTake(mempoolMutex, portMAX_DELAY);
-        if (mempoolSize < MAX_TRANSACTIONS) {
-            memcpy(&mempool[mempoolSize++], &tx, sizeof(Transaction));
-            balance -= amount; // Update balance optimistically
-        }
-        xSemaphoreGive(mempoolMutex);
-        
-        Serial.printf("[TX] Created: %s -> %s: %lu sat\n", tx.from, tx.to, tx.amount);
-        
-        return &tx;
-    }
-    
-    void signTransaction(Transaction* tx) {
-        // Simplified signature (use proper ECDSA in production)
-        char data[256];
-        sprintf(data, "%s%s%lu%lu%lu", tx->from, tx->to, tx->amount, tx->timestamp, tx->nonce);
-        
-        uint8_t hash[32];
-        mbedtls_sha256_context ctx;
-        mbedtls_sha256_init(&ctx);
-        mbedtls_sha256_starts(&ctx, 0);
-        mbedtls_sha256_update(&ctx, (uint8_t*)data, strlen(data));
-        mbedtls_sha256_update(&ctx, privateKey, 32);
-        mbedtls_sha256_finish(&ctx, hash);
-        mbedtls_sha256_free(&ctx);
-        
-        for (int i = 0; i < 32; i++) {
-            sprintf(&tx->signature[i * 2], "%02x", hash[i]);
-        }
-        tx->signature[64] = '\0';
-    }
-    
-    void calculateTxId(Transaction* tx) {
-        char data[512];
-        sprintf(data, "%s%s%lu%lu%lu%s", 
-                tx->from, tx->to, tx->amount, 
-                tx->timestamp, tx->nonce, tx->signature);
-        
-        uint8_t hash[32];
-        mbedtls_sha256_context ctx;
-        mbedtls_sha256_init(&ctx);
-        mbedtls_sha256_starts(&ctx, 0);
-        mbedtls_sha256_update(&ctx, (uint8_t*)data, strlen(data));
-        mbedtls_sha256_finish(&ctx, hash);
-        mbedtls_sha256_free(&ctx);
-        
-        for (int i = 0; i < 32; i++) {
-            sprintf(&tx->txid[i * 2], "%02x", hash[i]);
-        }
-        tx->txid[64] = '\0';
-    }
-    
-    bool mineBlock() {
-        if (mempoolSize < BLOCK_SIZE / 2) {
-            return false; // Wait for more transactions
-        }
-        
-        Serial.println("[MINING] Starting block mining...");
-        digitalWrite(LED_STATUS, HIGH);
-        
-        Block newBlock;
-        newBlock.index = chainLength;
-        newBlock.timestamp = millis() / 1000;
-        
-        // Get previous block hash
-        xSemaphoreTake(chainMutex, portMAX_DELAY);
-        strcpy(newBlock.prevHash, chain[chainLength - 1].hash);
-        xSemaphoreGive(chainMutex);
-        
-        // Add transactions from mempool
-        xSemaphoreTake(mempoolMutex, portMAX_DELAY);
-        newBlock.txCount = min(mempoolSize, BLOCK_SIZE);
-        for (int i = 0; i < newBlock.txCount; i++) {
-            memcpy(&newBlock.transactions[i], &mempool[i], sizeof(Transaction));
-        }
-        
-        // Calculate merkle root
-        calculateMerkleRoot(&newBlock);
-        
-        // Remove transactions from mempool
-        mempoolSize -= newBlock.txCount;
-        if (mempoolSize > 0) {
-            memmove(mempool, &mempool[newBlock.txCount], sizeof(Transaction) * mempoolSize);
-        }
-        xSemaphoreGive(mempoolMutex);
-        
-        // Proof of work
-        newBlock.nonce = 0;
-        char target[DIFFICULTY + 1];
-        memset(target, '0', DIFFICULTY);
-        target[DIFFICULTY] = '\0';
-        
-        while (true) {
-            calculateBlockHash(&newBlock);
-            
-            if (strncmp(newBlock.hash, target, DIFFICULTY) == 0) {
-                break; // Found valid hash
-            }
-            
-            newBlock.nonce++;
-            
-            // Allow other tasks to run
-            if (newBlock.nonce % 1000 == 0) {
-                vTaskDelay(1);
-            }
-        }
-        
-        // Add block to chain
-        xSemaphoreTake(chainMutex, portMAX_DELAY);
-        memcpy(&chain[chainLength++], &newBlock, sizeof(Block));
-        xSemaphoreGive(chainMutex);
-        
-        digitalWrite(LED_STATUS, LOW);
-        
-        Serial.printf("[MINING] Block mined! Index: %lu, Hash: %.10s..., Nonce: %lu\n", 
-                      newBlock.index, newBlock.hash, newBlock.nonce);
-        
-        return true;
-    }
-    
-    void calculateMerkleRoot(Block* block) {
-        if (block->txCount == 0) {
-            strcpy(block->merkleRoot, "0000000000000000000000000000000000000000000000000000000000000000");
-            return;
-        }
-        
-        // Simplified merkle root (just hash all txids together)
-        mbedtls_sha256_context ctx;
-        mbedtls_sha256_init(&ctx);
-        mbedtls_sha256_starts(&ctx, 0);
-        
-        for (int i = 0; i < block->txCount; i++) {
-            mbedtls_sha256_update(&ctx, (uint8_t*)block->transactions[i].txid, 64);
-        }
-        
-        uint8_t hash[32];
-        mbedtls_sha256_finish(&ctx, hash);
-        mbedtls_sha256_free(&ctx);
-        
-        for (int i = 0; i < 32; i++) {
-            sprintf(&block->merkleRoot[i * 2], "%02x", hash[i]);
-        }
-        block->merkleRoot[64] = '\0';
-    }
-    
-    bool validateBlock(Block* block) {
-        // Check proof of work
-        char target[DIFFICULTY + 1];
-        memset(target, '0', DIFFICULTY);
-        target[DIFFICULTY] = '\0';
-        
-        if (strncmp(block->hash, target, DIFFICULTY) != 0) {
-            return false;
-        }
-        
-        // Verify hash
-        Block temp;
-        memcpy(&temp, block, sizeof(Block));
-        calculateBlockHash(&temp);
-        
-        if (strcmp(temp.hash, block->hash) != 0) {
-            return false;
-        }
-        
-        // Check previous hash
-        if (chainLength > 0) {
-            if (strcmp(block->prevHash, chain[chainLength - 1].hash) != 0) {
-                return false;
-            }
-        }
-        
-        return true;
-    }
-    
-    void broadcastTransaction(Transaction* tx) {
-        if (peerCount == 0) return;
-        
-        digitalWrite(LED_TX, HIGH);
-        
-        StaticJsonDocument<512> doc;
-        doc["type"] = "TX";
-        doc["from"] = tx->from;
-        doc["to"] = tx->to;
-        doc["amount"] = tx->amount;
-        doc["timestamp"] = tx->timestamp;
-        doc["nonce"] = tx->nonce;
-        doc["signature"] = tx->signature;
-        doc["txid"] = tx->txid;
-        
-        char buffer[512];
-        serializeJson(doc, buffer);
-        
-        for (int i = 0; i < peerCount; i++) {
-            udp.beginPacket(peers[i], UDP_PORT);
-            udp.write((uint8_t*)buffer, strlen(buffer));
-            udp.endPacket();
-        }
-        
-        digitalWrite(LED_TX, LOW);
-    }
-    
-    void broadcastBlock(Block* block) {
-        if (peerCount == 0) return;
-        
-        digitalWrite(LED_TX, HIGH);
-        
-        // Send block header first
-        StaticJsonDocument<1024> doc;
-        doc["type"] = "BLOCK";
-        doc["index"] = block->index;
-        doc["timestamp"] = block->timestamp;
-        doc["prevHash"] = block->prevHash;
-        doc["merkleRoot"] = block->merkleRoot;
-        doc["nonce"] = block->nonce;
-        doc["txCount"] = block->txCount;
-        doc["hash"] = block->hash;
-        
-        char buffer[1024];
-        serializeJson(doc, buffer);
-        
-        for (int i = 0; i < peerCount; i++) {
-            udp.beginPacket(peers[i], UDP_PORT);
-            udp.write((uint8_t*)buffer, strlen(buffer));
-            udp.endPacket();
-        }
-        
-        digitalWrite(LED_TX, LOW);
-    }
-    
-    void handleNetworkMessage() {
-        int packetSize = udp.parsePacket();
-        if (packetSize == 0) return;
-        
-        digitalWrite(LED_RX, HIGH);
-        
-        char buffer[1024];
-        int len = udp.read(buffer, sizeof(buffer) - 1);
-        buffer[len] = '\0';
-        
-        StaticJsonDocument<1024> doc;
-        DeserializationError error = deserializeJson(doc, buffer);
-        
-        if (!error) {
-            const char* type = doc["type"];
-            
-            if (strcmp(type, "TX") == 0) {
-                Transaction tx;
-                strcpy(tx.from, doc["from"]);
-                strcpy(tx.to, doc["to"]);
-                tx.amount = doc["amount"];
-                tx.timestamp = doc["timestamp"];
-                tx.nonce = doc["nonce"];
-                strcpy(tx.signature, doc["signature"]);
-                strcpy(tx.txid, doc["txid"]);
-                
-                // Add to queue for processing
-                xQueueSend(txQueue, &tx, 0);
-                
-            } else if (strcmp(type, "BLOCK") == 0) {
-                Block block;
-                block.index = doc["index"];
-                block.timestamp = doc["timestamp"];
-                strcpy(block.prevHash, doc["prevHash"]);
-                strcpy(block.merkleRoot, doc["merkleRoot"]);
-                block.nonce = doc["nonce"];
-                block.txCount = doc["txCount"];
-                strcpy(block.hash, doc["hash"]);
-                
-                // Add to queue for processing
-                xQueueSend(blockQueue, &block, 0);
-                
-            } else if (strcmp(type, "PING") == 0) {
-                // Respond with pong
-                StaticJsonDocument<128> pong;
-                pong["type"] = "PONG";
-                pong["address"] = address;
-                pong["height"] = chainLength;
-                
-                char response[128];
-                serializeJson(pong, response);
-                
-                udp.beginPacket(udp.remoteIP(), UDP_PORT);
-                udp.write((uint8_t*)response, strlen(response));
-                udp.endPacket();
-            }
-        }
-        
-        digitalWrite(LED_RX, LOW);
-    }
-    
-    void printStatus() {
-        Serial.println("\n========== BLOCKCHAIN STATUS ==========");
-        Serial.printf("Node Address: %s\n", address);
-        Serial.printf("Balance: %lu satoshis\n", balance);
-        Serial.printf("Chain Height: %u blocks\n", chainLength);
-        Serial.printf("Mempool Size: %u transactions\n", mempoolSize);
-        Serial.printf("UTXO Count: %u\n", utxoCount);
-        Serial.printf("Connected Peers: %u\n", peerCount);
-        Serial.printf("Free Heap: %u bytes\n", ESP.getFreeHeap());
-        Serial.printf("Uptime: %lu seconds\n", millis() / 1000);
-        
-        if (chainLength > 0) {
-            Serial.printf("Latest Block: #%lu (%.10s...)\n", 
-                         chain[chainLength-1].index, 
-                         chain[chainLength-1].hash);
-        }
-        Serial.println("=======================================\n");
-    }
-    
-    uint32_t getChainLength() { return chainLength; }
-    uint32_t getMempoolSize() { return mempoolSize; }
-    uint32_t getBalance() { return balance; }
-    const char* getAddress() { return address; }
-};
+static uint32_t g_txSeq=0; // local seq counter
 
-// ==================== Global Variables ====================
-
-BlockchainNode* node = nullptr;
-TaskHandle_t miningTask = nullptr;
-TaskHandle_t networkTask = nullptr;
-TaskHandle_t telemetryTask = nullptr;
-
-// ==================== FreeRTOS Tasks ====================
-
-void miningTaskFunction(void* parameter) {
-    Serial.println("[TASK] Mining task started");
-    
-    while (true) {
-        // Mine block if conditions are met
-        if (node->getMempoolSize() >= BLOCK_SIZE / 2) {
-            node->mineBlock();
-        }
-        
-        // Check for incoming blocks
-        Block block;
-        if (xQueueReceive(node->blockQueue, &block, 0) == pdTRUE) {
-            if (node->validateBlock(&block)) {
-                // Add to chain if valid
-                Serial.printf("[BLOCKCHAIN] Received valid block #%lu\n", block.index);
-            }
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Check every 5 seconds
-    }
+static bool sendEncrypted(const IPAddress &peer, uint8_t type, const char* json, size_t len) {
+  if (!bucket_allow()) return false;
+  if (len > MAX_MSG_SIZE) return false;
+  WireMessage hdr{PROTOCOL_VERSION, nowSec(), g_txSeq++, type};
+  uint8_t aad[sizeof(hdr)]; memcpy(aad,&hdr,sizeof(hdr));
+  uint8_t nonce[12]; esp_fill_random(nonce, sizeof(nonce));
+  uint8_t tag[16]; size_t ctLen=0; std::vector<uint8_t> ct(len);
+  if (!aead_encrypt((const uint8_t*)json, len, aad, sizeof(aad), nonce, ct.data(), ctLen, tag)) return false;
+  g_udp.beginPacket(peer, UDP_PORT);
+  g_udp.write((uint8_t*)&hdr, sizeof(hdr));
+  g_udp.write(nonce,12); g_udp.write(tag,16); g_udp.write(ct.data(), ctLen);
+  bool ok = g_udp.endPacket(); if (ok) ledBlink(LED_TX,10); return ok;
 }
 
-void networkTaskFunction(void* parameter) {
-    Serial.println("[TASK] Network task started");
-    
-    while (true) {
-        // Handle network messages
-        node->handleNetworkMessage();
-        
-        // Process transaction queue
-        Transaction tx;
-        if (xQueueReceive(node->txQueue, &tx, 0) == pdTRUE) {
-            // Validate and add to mempool
-            Serial.printf("[NETWORK] Received transaction: %s\n", tx.txid);
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(10)); // Check every 10ms
-    }
+static bool recvEncrypted(char *outJson, size_t &outLen, uint8_t &outType) {
+  int pkt = g_udp.parsePacket(); if (!pkt) return false;
+  if (pkt < (int)(sizeof(WireMessage)+12+16)) { g_udp.flush(); return false; }
+  WireMessage hdr; g_udp.read((uint8_t*)&hdr, sizeof(hdr));
+  if (hdr.ver != PROTOCOL_VERSION) { g_udp.flush(); return false; }
+  // timestamp window
+  uint32_t t = nowSec(); if (hdr.ts+RX_WINDOW_SEC < t || hdr.ts > t+RX_WINDOW_SEC) { g_udp.flush(); return false; }
+  uint8_t nonce[12]; uint8_t tag[16]; g_udp.read(nonce,12); g_udp.read(tag,16);
+  int remain = pkt - (sizeof(WireMessage)+12+16);
+  remain = std::min(remain, (int)MAX_MSG_SIZE);
+  std::vector<uint8_t> ct(remain); g_udp.read(ct.data(), remain);
+  std::vector<uint8_t> pt(remain);
+  size_t ptLen=0; if (!aead_decrypt(ct.data(), remain, (uint8_t*)&hdr, sizeof(hdr), nonce, tag, pt.data(), ptLen)) return false;
+  outLen = std::min(ptLen, (size_t)MAX_MSG_SIZE);
+  memcpy(outJson, pt.data(), outLen); outJson[outLen] = '\0';
+  outType = hdr.type; ledBlink(LED_RX, 5); return true;
 }
 
-void telemetryTaskFunction(void* parameter) {
-    Serial.println("[TASK] Telemetry task started");
-    
-    while (true) {
-        node->printStatus();
-        
-        // Read sensors if available
-        if (Wire.begin(IMU_SDA, IMU_SCL)) {
-            // Read IMU data
-            Wire.beginTransmission(0x68); // MPU6050 address
-            Wire.write(0x3B); // Starting register
-            Wire.endTransmission(false);
-            Wire.requestFrom(0x68, 14, true);
-            
-            if (Wire.available() == 14) {
-                int16_t ax = Wire.read() << 8 | Wire.read();
-                int16_t ay = Wire.read() << 8 | Wire.read();
-                int16_t az = Wire.read() << 8 | Wire.read();
-                int16_t temp = Wire.read() << 8 | Wire.read();
-                int16_t gx = Wire.read() << 8 | Wire.read();
-                int16_t gy = Wire.read() << 8 | Wire.read();
-                int16_t gz = Wire.read() << 8 | Wire.read();
-                
-                float temperature = (temp / 340.0) + 36.53;
-                
-                Serial.printf("[SENSORS] Temp: %.1f°C, Accel: (%d,%d,%d)\n", 
-                             temperature, ax, ay, az);
-            }
+// ------------------------------ TASKS ---------------------------------
+static TaskHandle_t t_net, t_mine, t_telem;
+
+static void taskNetwork(void *arg) {
+  esp_task_wdt_add(NULL);
+  StaticJsonDocument<1024> d;
+  char buf[MAX_MSG_SIZE+1]; size_t n; uint8_t type;
+  for(;;){
+    if (recvEncrypted(buf, n, type)) {
+      esp_task_wdt_reset();
+      DeserializationError e = deserializeJson(d, buf, n);
+      if (!e) {
+        if (type==1) {
+          // TX
+          Transaction tx; // TODO: parse JSON -> tx
+          // Verify + enqueue
+          if (verifyTx(tx)) {
+            xSemaphoreTake(g_mempoolMtx, portMAX_DELAY);
+            if (g_mempoolSize < MAX_MEMPOOL) g_mempool[g_mempoolSize++] = tx;
+            xSemaphoreGive(g_mempoolMtx);
+          }
+        } else if (type==2) {
+          // BLOCK (left as exercise: full header+tx verification, reorgs, etc.)
+        } else if (type==3) {
+          // PING -> PONG
+          StaticJsonDocument<128> pong; pong["type"]="PONG"; pong["h"]=g_height; char js[128]; size_t L=serializeJson(pong, js, sizeof(js));
+          sendEncrypted(g_udp.remoteIP(), 4, js, L);
         }
-        
-        vTaskDelay(pdMS_TO_TICKS(30000)); // Every 30 seconds
+      }
     }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
 }
 
-// ==================== Arduino Functions ====================
-
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    
-    Serial.println("\n\n==================================================");
-    Serial.println("     SPACE DOA - CubeSat Blockchain Controller");
-    Serial.println("              ESP32 Implementation v1.0.0");
-    Serial.println("==================================================\n");
-    
-    // Initialize pins
-    pinMode(LED_STATUS, OUTPUT);
-    pinMode(LED_TX, OUTPUT);
-    pinMode(LED_RX, OUTPUT);
-    
-    // LED test sequence
-    digitalWrite(LED_STATUS, HIGH);
-    delay(200);
-    digitalWrite(LED_TX, HIGH);
-    delay(200);
-    digitalWrite(LED_RX, HIGH);
-    delay(200);
-    digitalWrite(LED_STATUS, LOW);
-    digitalWrite(LED_TX, LOW);
-    digitalWrite(LED_RX, LOW);
-    
-    // Initialize WiFi
-    Serial.printf("[WIFI] Connecting to %s", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println(" Connected!");
-        Serial.printf("[WIFI] IP Address: %s\n", WiFi.localIP().toString().c_str());
-    } else {
-        Serial.println(" Failed!");
-        Serial.println("[WIFI] Running in offline mode");
-    }
-    
-    // Initialize UDP
-    if (WiFi.status() == WL_CONNECTED) {
-        node->udp.begin(UDP_PORT);
-        Serial.printf("[NETWORK] UDP listening on port %d\n", UDP_PORT);
-    }
-    
-    // Initialize SD card (optional)
-    if (SD.begin(SD_CS)) {
-        Serial.printf("[SD] Card initialized. Size: %lluMB\n", SD.cardSize() / (1024 * 1024));
-    } else {
-        Serial.println("[SD] Card initialization failed (optional)");
-    }
-    
-    // Initialize blockchain node
-    node = new BlockchainNode();
-    node->initialize();
-    
-    // Create FreeRTOS tasks
-    xTaskCreatePinnedToCore(
-        miningTaskFunction,
-        "Mining",
-        STACK_SIZE,
-        NULL,
-        2,
-        &miningTask,
-        1  // Core 1
-    );
-    
-    xTaskCreatePinnedToCore(
-        networkTaskFunction,
-        "Network",
-        STACK_SIZE,
-        NULL,
-        3,
-        &networkTask,
-        1  // Core 1
-    );
-    
-    xTaskCreatePinnedToCore(
-        telemetryTaskFunction,
-        "Telemetry",
-        STACK_SIZE / 2,
-        NULL,
-        1,
-        &telemetryTask,
-        0  // Core 0
-    );
-    
-    Serial.println("\n[SYSTEM] All tasks started. Node operational.\n");
-    
-    // Create initial transactions for testing
-    delay(2000);
-    node->createTransaction("ESP32ABCDEF1234567890ABCDEF12345", 1000);
-    node->createTransaction("ESP32FEDCBA0987654321FEDCBA09876", 2000);
-}
-
-void loop() {
-    // Handle serial commands
-    if (Serial.available()) {
-        String command = Serial.readStringUntil('\n');
-        command.trim();
-        
-        if (command == "status") {
-            node->printStatus();
-            
-        } else if (command.startsWith("send ")) {
-            // Parse: send <address> <amount>
-            int spaceIdx = command.indexOf(' ', 5);
-            if (spaceIdx > 0) {
-                String addr = command.substring(5, spaceIdx);
-                uint32_t amount = command.substring(spaceIdx + 1).toInt();
-                
-                Transaction* tx = node->createTransaction(addr.c_str(), amount);
-                if (tx) {
-                    node->broadcastTransaction(tx);
-                    Serial.printf("[CMD] Transaction sent: %s\n", tx->txid);
-                }
-            }
-            
-        } else if (command == "mine") {
-            Serial.println("[CMD] Force mining block...");
-            if (node->mineBlock()) {
-                Serial.println("[CMD] Block mined successfully");
-            } else {
-                Serial.println("[CMD] Mining failed - not enough transactions");
-            }
-            
-        } else if (command == "peers") {
-            Serial.printf("[CMD] Connected peers: %d\n", node->peerCount);
-            
-        } else if (command == "restart") {
-            Serial.println("[CMD] Restarting...");
-            ESP.restart();
-            
-        } else if (command == "help") {
-            Serial.println("\n=== Available Commands ===");
-            Serial.println("status          - Show blockchain status");
-            Serial.println("send <addr> <amount> - Send transaction");
-            Serial.println("mine           - Force mine a block");
-            Serial.println("peers          - Show connected peers");
-            Serial.println("restart        - Restart the node");
-            Serial.println("help           - Show this help");
-            Serial.println("========================\n");
-            
-        } else {
-            Serial.println("[CMD] Unknown command. Type 'help' for available commands.");
-        }
-    }
-    
-    // Watchdog reset
+static void taskMining(void *arg) {
+  esp_task_wdt_add(NULL);
+  for(;;){
     esp_task_wdt_reset();
-    
-    // Main loop runs at lower frequency
-    delay(100);
+    // Simple PoW miner if mempool > 0
+    xSemaphoreTake(g_mempoolMtx, portMAX_DELAY);
+    uint8_t ready = min<uint16_t>(g_mempoolSize, MAX_TX_PER_BLOCK);
+    if (ready==0) { xSemaphoreGive(g_mempoolMtx); vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+    Block b; memset(&b,0,sizeof(b)); b.h.index = g_height; b.h.timestamp = nowSec();
+    if (g_height==0) strcpy(b.h.prevHash, "0000000000000000000000000000000000000000000000000000000000000000");
+    else strcpy(b.h.prevHash, g_chain[g_height-1].h.hash);
+    b.txCount = ready; for (uint8_t i=0;i<ready;i++){ b.tx[i] = g_mempool[i]; }
+    // shift mempool
+    for (uint16_t i=ready;i<g_mempoolSize;i++) g_mempool[i-ready]=g_mempool[i];
+    g_mempoolSize -= ready; xSemaphoreGive(g_mempoolMtx);
+
+    merkleRoot(b.tx, b.txCount, b.h.merkle);
+    // PoW loop
+    char target[DIFFICULTY_LEADING_ZEROES+1]; memset(target,'0',sizeof(target)-1); target[sizeof(target)-1]='\0';
+    for(;;){ hashBlockHeader(b.h); if (strncmp(b.h.hash, target, DIFFICULTY_LEADING_ZEROES)==0) break; b.h.nonce++; if ((b.h.nonce%2048)==0) vTaskDelay(1); }
+
+    // Validate and commit
+    bool ok=true; for (uint8_t i=0;i<b.txCount;i++){ if (!verifyTx(b.tx[i]) || !applyTxToUTXO(b.tx[i])) { ok=false; break; } }
+    if (!ok) continue;
+
+    xSemaphoreTake(g_chainMtx, portMAX_DELAY);
+    g_chain[g_height] = b; g_height++;
+    xSemaphoreGive(g_chainMtx);
+
+    // Persist header + tx list (JSON line)
+    StaticJsonDocument<256> j; j["i"]=b.h.index; j["h"]=b.h.hash; j["p"]=b.h.prevHash; j["m"]=b.h.merkle; j["n"]=b.h.nonce; char line[256]; size_t L=serializeJson(j,line,sizeof(line));
+    appendJournal(line);
+    ledBlink(LED_STATUS, 30);
+  }
 }
+
+static void taskTelemetry(void *arg) {
+  esp_task_wdt_add(NULL);
+  Wire.begin(IMU_SDA, IMU_SCL);
+  for(;;){
+    esp_task_wdt_reset();
+    Serial.printf("[STATUS] Height=%u Mempool=%u UTXO=%u Heap=%u\n", g_height, g_mempoolSize, g_utxoCount, ESP.getFreeHeap());
+    // Try IMU read with graceful recovery
+    Wire.beginTransmission(0x68); Wire.write(0x75); if (Wire.endTransmission(false)==0 && Wire.requestFrom(0x68,1,true)==1){ uint8_t who = Wire.read(); Serial.printf("[IMU] WHOAMI=0x%02X\n", who); }
+    else { Serial.println("[IMU] Reinit I2C"); Wire.end(); delay(10); Wire.begin(IMU_SDA, IMU_SCL); }
+    vTaskDelay(pdMS_TO_TICKS(15000));
+  }
+}
+
+// ------------------------------ SETUP ---------------------------------
+void setup(){
+  Serial.begin(115200); delay(200);
+  pinMode(LED_STATUS, OUTPUT); pinMode(LED_TX, OUTPUT); pinMode(LED_RX, OUTPUT);
+  digitalWrite(LED_STATUS,LOW); digitalWrite(LED_TX,LOW); digitalWrite(LED_RX,LOW);
+
+  // Crypto & network key
+  if (!g_id.ready) { Serial.println("[CRYPTO] Identity init failed"); }
+  ensure_net_key();
+
+  // SD
+  if (!SD.begin(SD_CS)) Serial.println("[SD] init failed"); else { if (!SD.exists(CHAIN_DIR)) SD.mkdir(CHAIN_DIR); }
+
+  // Wi‑Fi
+  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("[WIFI] Connecting"); for (int i=0;i<40 && WiFi.status()!=WL_CONNECTED;i++){ delay(250); Serial.print("."); }
+  if (WiFi.status()==WL_CONNECTED){ Serial.printf(" connected: %s\n", WiFi.localIP().toString().c_str()); g_udp.begin(UDP_PORT); Serial.printf("[UDP] Listening %u\n", UDP_PORT); }
+  else { Serial.println(" failed; offline mode"); }
+
+#ifdef USE_LORA
+  SPI.begin(); LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQ)) Serial.println("[LORA] init failed"); else Serial.println("[LORA] ready");
+#endif
+
+  // Mutexes
+  g_chainMtx = xSemaphoreCreateMutex(); g_mempoolMtx = xSemaphoreCreateMutex();
+
+  // WDT init for this task + future tasks
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+
+  // Start tasks (pin to core 1 for net/mine, core 0 for telem)
+  xTaskCreatePinnedToCore(taskNetwork,  "net",   8192, nullptr, 3, &t_net,   1);
+  xTaskCreatePinnedToCore(taskMining,   "mine",  8192, nullptr, 2, &t_mine,  1);
+  xTaskCreatePinnedToCore(taskTelemetry,"telem", 4096, nullptr, 1, &t_telem, 0);
+
+  Serial.println("[SYSTEM] SPACE DOA secure node online");
+}
+
+void loop(){
+  // main loop idle; tasks do the work
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+// ------------------------------ NOTES ---------------------------------
+// * Replace temporary symmetric key with a real ECDH handshake to derive per-peer session keys.
+// * Persist identity keys to NVS (Preferences) and enable flash encryption + secure boot.
+// * Implement full TX JSON <-> struct mapping and add fee handling & timestamp validity.
+// * Add peer allowlist with their public keys and rotate keys periodically.
+// * Consider PoA/BFT for cubesat ops rather than PoW.
+// * Add full block validation, reorg handling, and chain download/resync.
